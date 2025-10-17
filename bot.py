@@ -587,7 +587,7 @@ def perform_send(chat_id, from_uid, payload):
     conn.commit()
     if mode=="FNF":
         bot.send_message(chat_id, T(from_uid,"fnf_sent_sender", to=get_username(to_uid), amt=fmt_amount(asset,net)))
-        bot.send_message(to_uid, T(to_uid,"fnf_sent_receiver", from=get_username(from_uid), amt=fmt_amount(asset,net)))
+        bot.send_message(to_uid, T(to_uid, "fnf_sent_receiver", sender=get_username(from_uid), amt=fmt_amount(asset, net)))
     else:
         kb_sender = InlineKeyboardMarkup()
         kb_sender.add(InlineKeyboardButton("✅ Ware erhalten → Freigeben", callback_data=f"esc:release:{t_id}"),
