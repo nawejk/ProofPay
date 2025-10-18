@@ -35,6 +35,7 @@ from solders.system_program import transfer, TransferParams
 from solana.rpc.api import Client
 from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
+
 # ------------------ ENV ---------------------
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN","8222875136:AAFAa9HtRL-g23ganuckjCq5IIW9udQXOZo").strip()
@@ -58,13 +59,13 @@ if not BOT_TOKEN:
 if not CENTRAL_WALLET_SECRET or not CENTRAL_WALLET_ADDRESS:
     raise SystemExit("CENTRAL_WALLET_SECRET und CENTRAL_WALLET_ADDRESS sind Pflicht.")
 
-# Parse Solana Keypair (64-byte JSON array)
+# Parse Solana Keypair (64-byte JSON array) – FIXED: from_bytes + kp.pubkey()
 try:
     secret_list = json.loads(CENTRAL_WALLET_SECRET)
     if not (isinstance(secret_list, list) and len(secret_list) == 64):
         raise ValueError("CENTRAL_WALLET_SECRET muss 64-Byte JSON-Array sein (solana-keygen export).")
-    kp = Keypair.from_secret_key(bytes(secret_list))
-    if str(kp.public_key) != CENTRAL_WALLET_ADDRESS:
+    kp = Keypair.from_bytes(bytes(secret_list))
+    if str(kp.pubkey()) != CENTRAL_WALLET_ADDRESS:
         print("WARN: CENTRAL_WALLET_ADDRESS stimmt nicht mit Secret überein. Bitte prüfen.")
 except Exception as e:
     raise SystemExit(f"Ungültiger CENTRAL_WALLET_SECRET: {e}")
@@ -368,7 +369,6 @@ def on_cb(c):
         val=0 if u["twofa_enabled"] else 1
         conn.execute("UPDATE users SET twofa_enabled=? WHERE user_id=?", (val, c.from_user.id)); conn.commit()
         bot.answer_callback_query(c.id, T(c.from_user.id,"twofa_toggled", st=("AN" if val else "AUS")))
-        # zurück in Settings
         on_cb(type("obj",(),{"data":"m:set","from_user":c.from_user,"message":c.message,"id":c.id}))
 
     elif data.startswith("set:lang:"):
@@ -417,7 +417,6 @@ def on_deposit_source(uid, m):
                  reply_markup=menu(uid))
 
 def credit_deposit(uid, sol_amt, sig):
-    # Gutschrift & Log
     bal_adj(uid, "SOL", da=Decimal(sol_amt))
     conn.execute("INSERT INTO tx_log(id,type,user_from,user_to,asset,amount,fee,chain_sig,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                  (str(uuid.uuid4()),"deposit",uid,None,"SOL",float(sol_amt),0,str(sig),"{}",now_iso()))
@@ -427,9 +426,6 @@ def credit_deposit(uid, sol_amt, sig):
     except: pass
 
 def is_sol_deposit_from_source(tx_result, source_addr: str, dest_addr: str, min_sol: Decimal) -> tuple[bool, Decimal]:
-    """
-    Prüft parsed System-Transfer von source_addr → dest_addr und liefert (ok, amount_SOL)
-    """
     try:
         meta    = tx_result.get("meta", {})
         txn     = tx_result.get("transaction", {})
@@ -442,11 +438,9 @@ def is_sol_deposit_from_source(tx_result, source_addr: str, dest_addr: str, min_
                     sol = Decimal(lamports) / Decimal(1_000_000_000)
                     if sol >= min_sol:
                         return True, dquant(sol, 9)
-        # Fallback über Balances (falls Parser fehlt)
         keys = message.get("accountKeys", [])
         if source_addr in [k.get("pubkey") if isinstance(k, dict) else k for k in keys] and \
            dest_addr   in [k.get("pubkey") if isinstance(k, dict) else k for k in keys]:
-            # Indizes sauber ermitteln
             flat = [k.get("pubkey") if isinstance(k, dict) else k for k in keys]
             i_src = flat.index(source_addr)
             i_dst = flat.index(dest_addr)
@@ -466,7 +460,6 @@ def scan_deposits_loop():
     while True:
         try:
             sigs = get_sigs_for(CENTRAL_WALLET_ADDRESS, limit=60)
-            # alle registrierten Quellen laden (Set für schnellen Match)
             rows = conn.execute("SELECT user_id, source_addr FROM expected_sources").fetchall()
             expected = {}
             for r in rows:
@@ -479,7 +472,6 @@ def scan_deposits_loop():
                 if conn.execute("SELECT 1 FROM deposit_seen WHERE sig=?", (sig,)).fetchone():
                     continue
 
-                # Backoff gegen 429 bei getTransaction
                 tx = None
                 for attempt in range(5):
                     try:
@@ -493,14 +485,10 @@ def scan_deposits_loop():
                     conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,)); conn.commit()
                     continue
 
-                # parsed Ergebnis
-                result = tx  # bereits "result" aus rpc_post
-                # Prüfe für jede bekannte Source, ob diese TX ein Treffer ist
-                # (optimiert: wir extrahieren tatsächlichen Source aus der TX, dann matchen)
+                result = tx
                 ok_src = None
                 amt_sol = Decimal("0")
 
-                # Versuche die tatsächliche Quelle aus parsed Instruction zu lesen
                 try:
                     msg = result.get("transaction", {}).get("message", {})
                     for inst in msg.get("instructions", []):
@@ -516,10 +504,9 @@ def scan_deposits_loop():
                     pass
 
                 if ok_src:
-                    # alle Nutzer, die diese Quelle registriert haben, gutschreiben (normal: 1)
                     for uid in expected.get(ok_src, []):
                         credit_deposit(uid, amt_sol, sig)
-                # Signatur als gesehen markieren (damit später nicht erneut gescannt)
+
                 conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,))
                 conn.commit()
 
@@ -560,7 +547,6 @@ def send_amount(m, to_uid, to_uname):
 def send_go(c):
     _,_,mode,to_uid,to_uname,amt = c.data.split(":")
     to_uid=int(to_uid); amt=Decimal(amt)
-    # 2FA?
     u=get_user(c.from_user.id)
     if u["twofa_enabled"]:
         code=''.join(random.choices(string.digits,k=6))
@@ -580,9 +566,7 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     fee_percent = FEE_FNF + (FEE_ESCROW_EXTRA if mode=="ESCROW" else Decimal("0"))
     fee = dquant(amt * fee_percent / Decimal("100"), 9)
     net = dquant(amt - fee, 9)
-    # abbuchen Sender
     bal_adj(from_uid, "SOL", da=-amt)
-    # fee an "System" (User 0)
     bal_adj(0, "SOL", da=fee)
     if mode=="FNF":
         bal_adj(to_uid, "SOL", da=net)
@@ -604,13 +588,10 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
 
 # ------------------ WITHDRAW (echte On-Chain) --------------
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
-    # Address validate (Base58 32..44)
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
-
-    to_pk = PublicKey.from_string(to_addr)  # solders.Pubkey
+    to_pk = PublicKey.from_string(to_addr)
     tx = Transaction()
-    # Instruction aus solders.system_program
     instr = transfer(
         TransferParams(
             from_pubkey=kp.pubkey(),
@@ -619,16 +600,10 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
         )
     )
     tx.add(instr)
-
-    # Blockhash setzen & Fee Payer
     bh = rpc.get_latest_blockhash().value.blockhash
     tx.recent_blockhash = bh
     tx.fee_payer = kp.pubkey()
-
-    # Signieren mit solders.Keypair
     tx_signed = tx.sign([kp])
-
-    # Senden & optional bestätigen
     resp = rpc.send_transaction(tx_signed, opts=TxOpts(skip_preflight=False, max_retries=3))
     sig = resp.value
     rpc.confirm_transaction(sig)
