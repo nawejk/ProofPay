@@ -23,7 +23,7 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---- Solana libs: durchgehend solana.* (keine solders-Keypairs mehr!) ----
+# ---- Solana libs: nur solana.* verwenden (kein solders-Keypair) ----
 from solana.keypair import Keypair
 from solana.publickey import PublicKey
 from solana.system_program import transfer, TransferParams
@@ -54,7 +54,7 @@ if not BOT_TOKEN:
 if not CENTRAL_WALLET_SECRET or not CENTRAL_WALLET_ADDRESS:
     raise SystemExit("CENTRAL_WALLET_SECRET und CENTRAL_WALLET_ADDRESS sind Pflicht.")
 
-# Parse Solana Keypair (64-byte JSON array) – KORRIGIERT: solana.keypair.Keypair
+# Parse Solana Keypair (64-byte JSON array)
 try:
     secret_list = json.loads(CENTRAL_WALLET_SECRET)
     if not (isinstance(secret_list, list) and len(secret_list) == 64):
@@ -66,8 +66,8 @@ except Exception as e:
     raise SystemExit(f"Ungültiger CENTRAL_WALLET_SECRET: {e}")
 
 # RPC Clients
-rpc  = Client(SOL_RPC_URL)  # solana-py Client (für send_transaction, blockhash)
-sess = requests.Session()   # raw JSON-RPC für Reads (schnell, Backoff möglich)
+rpc  = Client(SOL_RPC_URL)
+sess = requests.Session()
 
 # ------------------ DB ----------------------
 DB="proofpay.db"
@@ -99,7 +99,6 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS deposit_seen(
         sig TEXT PRIMARY KEY
     )""")
-    # Nutzer -> erwartete QUELL-Adressen (ohne Memo-Tag)
     c.execute("""CREATE TABLE IF NOT EXISTS expected_sources(
         user_id INTEGER,
         source_addr TEXT,
@@ -238,12 +237,18 @@ def menu(uid):
     u = get_user(uid)
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_balance"], callback_data="m:bal"))
-    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_deposit"], callback_data="m:dep"),
-           InlineKeyboardButton(I18N[u["lang"]]["btn_send"], callback_data="m:send"))
-    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_withdraw"], callback_data="m:wd"),
-           InlineKeyboardButton(I18N[u["lang"]]["btn_history"], callback_data="m:hist"))
-    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_settings"], callback_data="m:set"),
-           InlineKeyboardButton(I18N[u["lang"]]["btn_support"], callback_data="m:sup"))
+    kb.add(
+        InlineKeyboardButton(I18N[u["lang"]]["btn_deposit"], callback_data="m:dep"),
+        InlineKeyboardButton(I18N[u["lang"]]["btn_send"],    callback_data="m:send")
+    )
+    kb.add(
+        InlineKeyboardButton(I18N[u["lang"]]["btn_withdraw"], callback_data="m:wd"),
+        InlineKeyboardButton(I18N[u["lang"]]["btn_history"],  callback_data="m:hist")
+    )
+    kb.add(
+        InlineKeyboardButton(I18N[u["lang"]]["btn_settings"], callback_data="m:set"),
+        InlineKeyboardButton(I18N[u["lang"]]["btn_support"],  callback_data="m:sup")
+    )
     return kb
 
 def safe_edit(chat_id, msg_id, text, reply_markup=None):
@@ -467,7 +472,7 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
-    to_pk = PublicKey(to_addr)  # solana.publickey.PublicKey ist str-initialisierbar
+    to_pk = PublicKey(to_addr)
     tx = Transaction()
     instr = transfer(
         TransferParams(
@@ -480,8 +485,7 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     bh = rpc.get_latest_blockhash().value.blockhash
     tx.recent_blockhash = bh
     tx.fee_payer = kp.public_key
-    # WICHTIG: solana.Keypair verwenden -> passt zum Transaction.sign()
-    tx_signed = tx.sign([kp])
+    tx_signed = tx.sign([kp])  # solana.Keypair => passt
     resp = rpc.send_transaction(tx_signed, opts=TxOpts(skip_preflight=False, max_retries=3))
     sig = resp.value
     rpc.confirm_transaction(sig)
@@ -539,15 +543,14 @@ def sup_msg(m):
         except: pass
     bot.reply_to(m, "Danke! Wir melden uns hier im Chat.", reply_markup=menu(m.from_user.id))
 
-# ------------- Callbacks / Screens (catch-all am Ende, aber mit Spezialfällen) ------------
+# ------------- Callbacks / Screens (catch-all) ------------
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c):
     ensure_user(c.from_user)
     data=c.data or ""
 
-    # --- Spezialfälle zuerst, damit nichts „verschluckt“ wird ---
+    # Spezialfälle zuerst (damit nichts verschluckt wird)
     if data.startswith("send:go:"):
-        # send:go:<MODE>:<to_uid>:<to_uname>:<amt>
         _,_,mode,to_uid,to_uname,amt = data.split(":")
         to_uid=int(to_uid); amt=Decimal(amt)
         u=get_user(c.from_user.id)
@@ -568,7 +571,6 @@ def on_cb(c):
         bot.register_next_step_handler(msg, sup_msg)
         return
 
-    # --- Normale Menüpunkte ---
     if data in ("m:home","m:bal"):
         lines=[]
         for a in ASSETS:
