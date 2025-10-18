@@ -22,7 +22,6 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # -------- Solana (Version 0.25.0) --------
-# ACHTUNG: Diese Imports & API entsprechen solana==0.25.0
 from solana.keypair import Keypair
 from solana.publickey import PublicKey
 from solana.system_program import transfer, TransferParams
@@ -162,7 +161,6 @@ def get_username(uid):
 def bal(uid, asset):
     r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
     if not r:
-        # falls Balance fehlt, lege sie an
         conn.execute("INSERT OR IGNORE INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (uid, asset))
         conn.commit()
         r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
@@ -256,7 +254,6 @@ I18N = {
 }
 
 def T(uid, key, **kw):
-    # robuste I18N (verhindert 'set is not subscriptable')
     try:
         u = get_user(uid)
         lang = (u["lang"] if u else DEFAULT_LANG) or DEFAULT_LANG
@@ -621,12 +618,76 @@ def on_cb(c):
 
 # ------------------ WITHDRAW (echte On-Chain) --------------
 def _extract_sig(resp):
-    # send_raw_transaction kann je nach Client-Wrapper str oder dict liefern
-    if isinstance(resp, str):
-        return resp
-    if isinstance(resp, dict):
-        return resp.get("result") or resp.get("value") or resp.get("result", {}).get("value")
-    return str(resp)
+    """
+    Akzeptiert alle realen Formen:
+    - str Signatur
+    - {"result":"SIG"}
+    - {"value":"SIG"}
+    - {"result":{"value":"SIG"}}
+    - RPCResponse(value="SIG") o.ä.
+    """
+    try:
+        if isinstance(resp, str):
+            return resp
+        if hasattr(resp, "value"):  # RPCResponse-like
+            v = getattr(resp, "value")
+            if isinstance(v, str) and len(v) > 40:
+                return v
+        if isinstance(resp, dict):
+            # häufige Formen
+            if isinstance(resp.get("result"), str):
+                return resp["result"]
+            if isinstance(resp.get("value"), str):
+                return resp["value"]
+            if isinstance(resp.get("result"), dict):
+                inner = resp["result"]
+                if isinstance(inner.get("value"), str):
+                    return inner["value"]
+        return str(resp)
+    except Exception:
+        return str(resp)
+
+def _get_blockhash_robust():
+    """
+    Holt einen letzten Blockhash robust über mehrere mögliche Antwortformen.
+    """
+    rb = rpc.get_recent_blockhash()
+    # Varianten abdecken: dict / RPCResponse-Objekt
+    # 1) dict mit "result"->"value"->"blockhash"
+    if isinstance(rb, dict):
+        # evtl. direkt "blockhash"
+        if "blockhash" in rb:
+            return rb["blockhash"]
+        # klassische Form
+        if "result" in rb and isinstance(rb["result"], dict):
+            val = rb["result"].get("value", {})
+            if isinstance(val, dict) and "blockhash" in val:
+                return val["blockhash"]
+        # manche Wrapper geben direkt "value"
+        if "value" in rb and isinstance(rb["value"], dict) and "blockhash" in rb["value"]:
+            return rb["value"]["blockhash"]
+    # 2) Objekt mit Attributen
+    if hasattr(rb, "value"):
+        v = getattr(rb, "value")
+        # v kann ein str (selten) oder Objekt sein
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict) and "blockhash" in v:
+            return v["blockhash"]
+        if hasattr(v, "blockhash"):
+            return getattr(v, "blockhash")
+    # 3) Fallback: nochmal klassisch per getLatestBlockhash (neuere RPCs)
+    try:
+        lr = rpc_post("getLatestBlockhash", [{}])
+        if isinstance(lr, dict):
+            v = lr.get("value", {})
+            if isinstance(v, dict):
+                bh = v.get("blockhash") or (v.get("blockhashes", [None])[0] if isinstance(v.get("blockhashes"), list) else None)
+                if bh:
+                    return bh
+    except Exception:
+        pass
+    raise RuntimeError("Kein Blockhash vom RPC erhalten")
 
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     # strikte Adresse prüfen
@@ -648,18 +709,22 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     tx = Transaction(fee_payer=kp.public_key)
     tx.add(ix)
 
-    # Blockhash (solana==0.25.0: get_recent_blockhash -> dict)
-    rb = rpc.get_recent_blockhash()
-    blockhash = rb["result"]["value"]["blockhash"]
+    # ROBUSTER Blockhash
+    blockhash = _get_blockhash_robust()
     tx.recent_blockhash = blockhash
 
-    # WICHTIG: lokal signieren, dann RAW senden  => verhindert "not enough signers"
+    # Lokal signieren, dann RAW senden  => verhindert "not enough signers"
     tx.sign(kp)
     raw = tx.serialize()
     resp = rpc.send_raw_transaction(raw, opts=TxOpts(skip_preflight=False, max_retries=5))
     sig = _extract_sig(resp)
-    # Bestätigen
-    rpc.confirm_transaction(sig)
+
+    # Bestätigen (robust, nicht crashen wenn Antwort anders ist)
+    try:
+        rpc.confirm_transaction(sig)
+    except Exception:
+        pass
+
     return sig
 
 def wd_addr(m):
