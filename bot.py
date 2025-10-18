@@ -439,26 +439,36 @@ def _extract_sig(resp):
     raise RuntimeError(f"unexpected send_transaction() response: {resp}")
 
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
+    # Zieladresse prüfen
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
+
     to_pk = PublicKey(to_addr)
+
+    # Transaktion OHNE manuelles Blockhash/Fee-Payer/Signieren bauen
     tx = Transaction()
-    instr = transfer(
-        TransferParams(
-            from_pubkey=kp.public_key,
-            to_pubkey=to_pk,
-            lamports=int(sol_amt * Decimal(1_000_000_000))
+    tx.add(
+        transfer(
+            TransferParams(
+                from_pubkey=kp.public_key,      # Absender = Hot-Wallet
+                to_pubkey=to_pk,                 # Empfänger
+                lamports=int(sol_amt * Decimal(1_000_000_000))
+            )
         )
     )
-    tx.add(instr)
-    # Blockhash & FeePayer setzen
-    bh_resp = rpc.get_latest_blockhash()
-    bh = _extract_latest_blockhash(bh_resp)
-    tx.recent_blockhash = bh
-    tx.fee_payer = kp.public_key
-    # Für solana 0.25.x: Wallet direkt an send_transaction übergeben (signing inside)
-    resp = rpc.send_transaction(tx, kp, opts=TxOpts(skip_preflight=False, max_retries=3))
+
+    # solana-py 0.25.x: send_transaction holt Blockhash, setzt fee_payer
+    # und signiert intern mit dem/den übergebenen Keypair(s).
+    resp = rpc.send_transaction(
+        tx,
+        kp,                                    # <- WICHTIG: dein Keypair hier übergeben
+        opts=TxOpts(skip_preflight=False, max_retries=5)
+    )
+
+    # Signatur robust extrahieren (dict- oder Objekt-Response)
     sig = _extract_sig(resp)
+
+    # (Optional) Bestätigung abwarten
     rpc.confirm_transaction(sig)
     return sig
 
