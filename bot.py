@@ -12,10 +12,6 @@ Hauptfeatures:
 - 2FA (6-stellig) für kritische Aktionen (Senden, Auszahlen)
 - Support: Nachricht an Admins
 - Stabil: Backoff bei 429/Rate-Limits, klare Fehlerhinweise
-
-WICHTIG:
-- Du brauchst einen funktionierenden RPC-Endpoint (am besten mit API-Key)
-- CENTRAL_WALLET_SECRET muss 64-Byte ed25519 JSON-Array sein (Solana Keypair export)
 """
 
 import os, json, time, threading, sqlite3, uuid, random, string, re
@@ -27,11 +23,10 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---- Solana libs (für echte Auszahlung) ----
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey as PublicKey
-from solders.system_program import transfer, TransferParams
-
+# ---- Solana libs: durchgehend solana.* (keine solders-Keypairs mehr!) ----
+from solana.keypair import Keypair
+from solana.publickey import PublicKey
+from solana.system_program import transfer, TransferParams
 from solana.rpc.api import Client
 from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
@@ -59,13 +54,13 @@ if not BOT_TOKEN:
 if not CENTRAL_WALLET_SECRET or not CENTRAL_WALLET_ADDRESS:
     raise SystemExit("CENTRAL_WALLET_SECRET und CENTRAL_WALLET_ADDRESS sind Pflicht.")
 
-# Parse Solana Keypair (64-byte JSON array) – FIXED: from_bytes + kp.pubkey()
+# Parse Solana Keypair (64-byte JSON array) – KORRIGIERT: solana.keypair.Keypair
 try:
     secret_list = json.loads(CENTRAL_WALLET_SECRET)
     if not (isinstance(secret_list, list) and len(secret_list) == 64):
         raise ValueError("CENTRAL_WALLET_SECRET muss 64-Byte JSON-Array sein (solana-keygen export).")
-    kp = Keypair.from_bytes(bytes(secret_list))
-    if str(kp.pubkey()) != CENTRAL_WALLET_ADDRESS:
+    kp = Keypair.from_secret_key(bytes(secret_list))
+    if str(kp.public_key) != CENTRAL_WALLET_ADDRESS:
         print("WARN: CENTRAL_WALLET_ADDRESS stimmt nicht mit Secret überein. Bitte prüfen.")
 except Exception as e:
     raise SystemExit(f"Ungültiger CENTRAL_WALLET_SECRET: {e}")
@@ -244,7 +239,7 @@ def menu(uid):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_balance"], callback_data="m:bal"))
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_deposit"], callback_data="m:dep"),
-           InlineKeyboardButton(I18N[u["lang"]]["btn_send"], callback_data="m:send"))
+           InlineKeyboardButton(I18N[u["lang"]"]["btn_send"], callback_data="m:send"))
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_withdraw"], callback_data="m:wd"),
            InlineKeyboardButton(I18N[u["lang"]]["btn_history"], callback_data="m:hist"))
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_settings"], callback_data="m:set"),
@@ -259,7 +254,6 @@ def safe_edit(chat_id, msg_id, text, reply_markup=None):
 
 # ------------------ RPC helper ----------------
 def rpc_post(method, params):
-    # Backoff bei 429/Rate-Limits
     tries=0
     delay=0.8
     while True:
@@ -271,7 +265,6 @@ def rpc_post(method, params):
         r.raise_for_status()
         j=r.json()
         if "error" in j:
-            # -32005 ist oft rate limit / data too large
             if j["error"].get("code") in (-32005,):
                 tries+=1
                 if tries>6: raise RuntimeError(j["error"])
@@ -288,7 +281,6 @@ def get_tx(sig):
 # ------------------ Commands ------------------
 @bot.message_handler(commands=["start"])
 def start(m):
-    # Referral? /start R123
     ref_by=None
     if m.text and len(m.text.split())>1:
         code=m.text.split()[1].strip()
@@ -303,106 +295,7 @@ def cmd_menu(m):
     ensure_user(m.from_user)
     bot.reply_to(m, T(m.from_user.id,"menu"), reply_markup=menu(m.from_user.id))
 
-# ------------- Callbacks / Screens ------------
-@bot.callback_query_handler(func=lambda c: True)
-def on_cb(c):
-    ensure_user(c.from_user)
-    data=c.data
-    if data in ("m:home","m:bal"):
-        lines=[]
-        for a in ASSETS:
-            av,hd = bal(c.from_user.id,a)
-            lines.append(T(c.from_user.id,"line", asset=a, av=fmt(a,av), hd=fmt(a,hd)))
-        txt=T(c.from_user.id,"balance", lines="\n".join(lines), addr=CENTRAL_WALLET_ADDRESS)
-        safe_edit(c.message.chat.id, c.message.message_id, txt, reply_markup=menu(c.from_user.id))
-
-    elif data=="m:dep":
-        msg = bot.send_message(c.message.chat.id, T(c.from_user.id,"deposit_ask_source"))
-        bot.register_next_step_handler(msg, lambda x: on_deposit_source(c.from_user.id, x))
-
-    elif data=="m:send":
-        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"send_who"))
-        bot.register_next_step_handler(msg, send_who)
-
-    elif data=="m:hist":
-        rows = conn.execute("SELECT * FROM tx_log WHERE user_from=? OR user_to=? ORDER BY datetime(created_at) DESC LIMIT 20",
-                            (c.from_user.id, c.from_user.id)).fetchall()
-        if not rows:
-            txt = T(c.from_user.id,"history_none")
-        else:
-            out=["🧾 <b>Verlauf</b>"]
-            for r in rows:
-                meta = json.loads(r["meta"] or "{}")
-                sig = r["chain_sig"] or "-"
-                if r["type"]=="deposit":
-                    out.append(f"➕ {fmt(r['asset'], r['amount'])} | tx: <code>{sig}</code>")
-                elif r["type"]=="send":
-                    other = r["user_to"]
-                    out.append(f"📤 {fmt(r['asset'], r['amount'])} → @{get_username(other)} (fee {Decimal(str(r['fee']))}%)")
-                elif r["type"]=="escrow_hold":
-                    other = r["user_to"]
-                    out.append(f"🛡️ HOLD {fmt(r['asset'], r['amount'])} → @{get_username(other)} (fee {Decimal(str(r['fee']))}%)")
-                elif r["type"]=="escrow_release":
-                    other = r["user_to"]
-                    out.append(f"✅ RELEASE {fmt(r['asset'], r['amount'])} → @{get_username(other)}")
-                elif r["type"]=="withdraw":
-                    out.append(f"💸 {fmt(r['asset'], r['amount'])} → {meta.get('to','addr')} | tx: <code>{sig}</code>")
-            txt="\n".join(out)
-        safe_edit(c.message.chat.id, c.message.message_id, txt, reply_markup=menu(c.from_user.id))
-
-    elif data=="m:wd":
-        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"withdraw_addr", min=f"{MIN_WITHDRAW_SOL} SOL"))
-        bot.register_next_step_handler(msg, wd_addr)
-
-    elif data=="m:set":
-        u=get_user(c.from_user.id); twofa="AN" if u["twofa_enabled"] else "AUS"
-        txt=T(c.from_user.id,"settings", lang=u["lang"], twofa=twofa, ref=u["ref_code"])
-        kb=InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔐 2FA AN/AUS", callback_data="set:2fa"))
-        kb.add(InlineKeyboardButton("🌐 Deutsch", callback_data="set:lang:de"),
-               InlineKeyboardButton("🌐 English", callback_data="set:lang:en"))
-        kb.add(InlineKeyboardButton("⬅️ Back", callback_data="m:home"))
-        safe_edit(c.message.chat.id, c.message.message_id, txt, reply_markup=kb)
-
-    elif data=="set:2fa":
-        u=get_user(c.from_user.id)
-        val=0 if u["twofa_enabled"] else 1
-        conn.execute("UPDATE users SET twofa_enabled=? WHERE user_id=?", (val, c.from_user.id)); conn.commit()
-        bot.answer_callback_query(c.id, T(c.from_user.id,"twofa_toggled", st=("AN" if val else "AUS")))
-        on_cb(type("obj",(),{"data":"m:set","from_user":c.from_user,"message":c.message,"id":c.id}))
-
-    elif data.startswith("set:lang:"):
-        lang=data.split(":")[2]
-        if lang in ("de","en"):
-            conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, c.from_user.id)); conn.commit()
-        on_cb(type("obj",(),{"data":"m:set","from_user":c.from_user,"message":c.message,"id":c.id}))
-
-    elif data.startswith("esc:release:"):
-        t_id=data.split(":")[2]
-        tr = conn.execute("SELECT * FROM tx_log WHERE id=? AND type='escrow_hold'", (t_id,)).fetchone()
-        if not tr or tr["user_from"]!=c.from_user.id:
-            bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
-        amt=Decimal(str(tr["amount"])); asset=tr["asset"]; seller=tr["user_to"]
-        av,hd = bal(seller, asset)
-        if hd < amt:
-            bot.answer_callback_query(c.id, "Fehler: nicht genug gehalten.", show_alert=True); return
-        bal_set(seller, asset, av+amt, hd-amt)
-        conn.execute("INSERT INTO tx_log(id,type,user_from,user_to,asset,amount,fee,chain_sig,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                     (str(uuid.uuid4()),"escrow_release",tr["user_from"],tr["user_to"],asset,float(amt),0,None,"{}",now_iso()))
-        conn.commit()
-        bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_release_ok"))
-        bot.send_message(tr["user_to"], "✅ Betrag aus Escrow freigegeben.")
-
-    elif data.startswith("esc:dispute:"):
-        t_id=data.split(":")[2]
-        tr = conn.execute("SELECT * FROM tx_log WHERE id=? AND type='escrow_hold'", (t_id,)).fetchone()
-        if not tr:
-            bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
-        for a in ADMIN_IDS:
-            bot.send_message(a, f"⚠️ Dispute: BUYER @{get_username(tr['user_from'])} vs SELLER @{get_username(tr['user_to'])} | {fmt(tr['asset'],tr['amount'])}\nTxID: {t_id}")
-        bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_dispute_open"))
-
-# ------------------ DEPOSIT FLOW (NEU – Quelle-Wallet) ----------------
+# ------------------ DEPOSIT FLOW (Quelle-Wallet) ----------------
 def is_valid_pubkey(addr:str)->bool:
     return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", addr or ""))
 
@@ -425,7 +318,7 @@ def credit_deposit(uid, sol_amt, sig):
         bot.send_message(uid, T(uid,"deposit_booked", amt=str(sol_amt), sig=sig))
     except: pass
 
-def is_sol_deposit_from_source(tx_result, source_addr: str, dest_addr: str, min_sol: Decimal) -> tuple[bool, Decimal]:
+def is_sol_deposit_from_source(tx_result, source_addr: str, dest_addr: str, min_sol: Decimal):
     try:
         meta    = tx_result.get("meta", {})
         txn     = tx_result.get("transaction", {})
@@ -543,22 +436,6 @@ def send_amount(m, to_uid, to_uname):
                                 callback_data=f"send:go:ESCROW:{to_uid}:{to_uname}:{amt}"))
     bot.reply_to(m, T(m.from_user.id,"send_mode", amt=str(amt)), reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("send:go:"))
-def send_go(c):
-    _,_,mode,to_uid,to_uname,amt = c.data.split(":")
-    to_uid=int(to_uid); amt=Decimal(amt)
-    u=get_user(c.from_user.id)
-    if u["twofa_enabled"]:
-        code=''.join(random.choices(string.digits,k=6))
-        bot.answer_callback_query(c.id, f"🔐 Code: {code}")
-        bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
-        def check_code(m):
-            if (m.text or "").strip()!=code: bot.reply_to(m,"Falscher Code."); return
-            do_send(m.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
-        bot.register_next_step_handler(c.message, check_code)
-    else:
-        do_send(c.message.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
-
 def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     av,_=bal(from_uid, "SOL")
     if amt>av:
@@ -590,11 +467,11 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
-    to_pk = PublicKey.from_string(to_addr)
+    to_pk = PublicKey(to_addr)  # solana.publickey.PublicKey ist str-initialisierbar
     tx = Transaction()
     instr = transfer(
         TransferParams(
-            from_pubkey=kp.pubkey(),
+            from_pubkey=kp.public_key,
             to_pubkey=to_pk,
             lamports=int(sol_amt * Decimal(1_000_000_000))
         )
@@ -602,7 +479,8 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     tx.add(instr)
     bh = rpc.get_latest_blockhash().value.blockhash
     tx.recent_blockhash = bh
-    tx.fee_payer = kp.pubkey()
+    tx.fee_payer = kp.public_key
+    # WICHTIG: solana.Keypair verwenden -> passt zum Transaction.sign()
     tx_signed = tx.sign([kp])
     resp = rpc.send_transaction(tx_signed, opts=TxOpts(skip_preflight=False, max_retries=3))
     sig = resp.value
@@ -653,16 +531,137 @@ def wd_amount(m, to_addr):
         finalize()
 
 # ------------------ SUPPORT -------------------
-@bot.callback_query_handler(func=lambda c: c.data=="m:sup")
-def sup(c):
-    msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"support_prompt"))
-    bot.register_next_step_handler(msg, sup_msg)
-
 def sup_msg(m):
     txt=m.text or "(ohne Text)"
     for a in ADMIN_IDS:
-        bot.send_message(a, f"🆘 Support von @{get_username(m.from_user.id)} ({m.from_user.id}):\n\n{txt}")
+        try:
+            bot.send_message(a, f"🆘 Support von @{get_username(m.from_user.id)} ({m.from_user.id}):\n\n{txt}")
+        except: pass
     bot.reply_to(m, "Danke! Wir melden uns hier im Chat.", reply_markup=menu(m.from_user.id))
+
+# ------------- Callbacks / Screens (catch-all am Ende, aber mit Spezialfällen) ------------
+@bot.callback_query_handler(func=lambda c: True)
+def on_cb(c):
+    ensure_user(c.from_user)
+    data=c.data or ""
+
+    # --- Spezialfälle zuerst, damit nichts „verschluckt“ wird ---
+    if data.startswith("send:go:"):
+        # send:go:<MODE>:<to_uid>:<to_uname>:<amt>
+        _,_,mode,to_uid,to_uname,amt = data.split(":")
+        to_uid=int(to_uid); amt=Decimal(amt)
+        u=get_user(c.from_user.id)
+        if u["twofa_enabled"]:
+            code=''.join(random.choices(string.digits,k=6))
+            bot.answer_callback_query(c.id, f"🔐 Code: {code}")
+            bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
+            def check_code(m):
+                if (m.text or "").strip()!=code: bot.reply_to(m,"Falscher Code."); return
+                do_send(m.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
+            bot.register_next_step_handler(c.message, check_code)
+        else:
+            do_send(c.message.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
+        return
+
+    if data=="m:sup":
+        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"support_prompt"))
+        bot.register_next_step_handler(msg, sup_msg)
+        return
+
+    # --- Normale Menüpunkte ---
+    if data in ("m:home","m:bal"):
+        lines=[]
+        for a in ASSETS:
+            av,hd = bal(c.from_user.id,a)
+            lines.append(T(c.from_user.id,"line", asset=a, av=fmt(a,av), hd=fmt(a,hd)))
+        txt=T(c.from_user.id,"balance", lines="\n".join(lines), addr=CENTRAL_WALLET_ADDRESS)
+        safe_edit(c.message.chat.id, c.message.message_id, txt, reply_markup=menu(c.from_user.id))
+
+    elif data=="m:dep":
+        msg = bot.send_message(c.message.chat.id, T(c.from_user.id,"deposit_ask_source"))
+        bot.register_next_step_handler(msg, lambda x: on_deposit_source(c.from_user.id, x))
+
+    elif data=="m:send":
+        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"send_who"))
+        bot.register_next_step_handler(msg, send_who)
+
+    elif data=="m:hist":
+        rows = conn.execute("SELECT * FROM tx_log WHERE user_from=? OR user_to=? ORDER BY datetime(created_at) DESC LIMIT 20",
+                            (c.from_user.id, c.from_user.id)).fetchall()
+        if not rows:
+            txt = T(c.from_user.id,"history_none")
+        else:
+            out=["🧾 <b>Verlauf</b>"]
+            for r in rows:
+                meta = json.loads(r["meta"] or "{}")
+                sig = r["chain_sig"] or "-"
+                if r["type"]=="deposit":
+                    out.append(f"➕ {fmt(r['asset'], r['amount'])} | tx: <code>{sig}</code>")
+                elif r["type"]=="send":
+                    other = r["user_to"]
+                    out.append(f"📤 {fmt(r['asset'], r['amount'])} → @{get_username(other)} (fee {Decimal(str(r['fee']))}%)")
+                elif r["type"]=="escrow_hold":
+                    other = r["user_to"]
+                    out.append(f"🛡️ HOLD {fmt(r['asset'], r['amount'])} → @{get_username(other)} (fee {Decimal(str(r['fee']))}%)")
+                elif r["type"]=="escrow_release":
+                    other = r["user_to"]
+                    out.append(f"✅ RELEASE {fmt(r['asset'], r['amount'])} → @{get_username(other)}")
+                elif r["type"]=="withdraw":
+                    out.append(f"💸 {fmt(r['asset'], r['amount'])} → {meta.get('to','addr')} | tx: <code>{sig}</code>")
+            txt="\n".join(out)
+        safe_edit(c.message.chat.id, c.message.message_id, txt, reply_markup=menu(c.from_user.id))
+
+    elif data=="m:wd":
+        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"withdraw_addr", min=f"{MIN_WITHDRAW_SOL} SOL"))
+        bot.register_next_step_handler(msg, wd_addr)
+
+    elif data=="m:set":
+        u=get_user(c.from_user.id); twofa="AN" if u["twofa_enabled"] else "AUS"
+        txt=T(c.from_user.id,"settings", lang=u["lang"], twofa=twofa, ref=u["ref_code"])
+        kb=InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔐 2FA AN/AUS", callback_data="set:2fa"))
+        kb.add(InlineKeyboardButton("🌐 Deutsch", callback_data="set:lang:de"),
+               InlineKeyboardButton("🌐 English", callback_data="set:lang:en"))
+        kb.add(InlineKeyboardButton("⬅️ Back", callback_data="m:home"))
+        safe_edit(c.message.chat.id, c.message.message_id, txt, reply_markup=kb)
+
+    elif data=="set:2fa":
+        u=get_user(c.from_user.id)
+        val=0 if u["twofa_enabled"] else 1
+        conn.execute("UPDATE users SET twofa_enabled=? WHERE user_id=?", (val, c.from_user.id)); conn.commit()
+        bot.answer_callback_query(c.id, T(c.from_user.id,"twofa_toggled", st=("AN" if val else "AUS")))
+        on_cb(type("obj",(),{"data":"m:set","from_user":c.from_user,"message":c.message,"id":c.id}))
+
+    elif data.startswith("set:lang:"):
+        lang=data.split(":")[2]
+        if lang in ("de","en"):
+            conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, c.from_user.id)); conn.commit()
+        on_cb(type("obj",(),{"data":"m:set","from_user":c.from_user,"message":c.message,"id":c.id}))
+
+    elif data.startswith("esc:release:"):
+        t_id=data.split(":")[2]
+        tr = conn.execute("SELECT * FROM tx_log WHERE id=? AND type='escrow_hold'", (t_id,)).fetchone()
+        if not tr or tr["user_from"]!=c.from_user.id:
+            bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
+        amt=Decimal(str(tr["amount"])); asset=tr["asset"]; seller=tr["user_to"]
+        av,hd = bal(seller, asset)
+        if hd < amt:
+            bot.answer_callback_query(c.id, "Fehler: nicht genug gehalten.", show_alert=True); return
+        bal_set(seller, asset, av+amt, hd-amt)
+        conn.execute("INSERT INTO tx_log(id,type,user_from,user_to,asset,amount,fee,chain_sig,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (str(uuid.uuid4()),"escrow_release",tr["user_from"],tr["user_to"],asset,float(amt),0,None,"{}",now_iso()))
+        conn.commit()
+        bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_release_ok"))
+        bot.send_message(tr["user_to"], "✅ Betrag aus Escrow freigegeben.")
+
+    elif data.startswith("esc:dispute:"):
+        t_id=data.split(":")[2]
+        tr = conn.execute("SELECT * FROM tx_log WHERE id=? AND type='escrow_hold'", (t_id,)).fetchone()
+        if not tr:
+            bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
+        for a in ADMIN_IDS:
+            bot.send_message(a, f"⚠️ Dispute: BUYER @{get_username(tr['user_from'])} vs SELLER @{get_username(tr['user_to'])} | {fmt(tr['asset'],tr['amount'])}\nTxID: {t_id}")
+        bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_dispute_open"))
 
 # ------------------ FALLBACK ------------------
 @bot.message_handler(content_types=["text","photo","document","sticker","video","audio","voice"])
