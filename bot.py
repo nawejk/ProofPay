@@ -1,17 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ProofPay – Telegram Bot (SOL on-chain, Auto-Deposit/Auto-Withdraw, Escrow)
-Kompatibel mit: solana==0.30.2
-
-Hauptfeatures:
-- Nutzer-Registrierung, schönes Hauptmenü (DE/EN)
-- Einzahlungen (NEU): User gibt seine QUELL-Wallet an → Bot erkennt on-chain Zahlungen
-- Auszahlungen: echte SOL-Transaktion von Bot-Hotwallet -> Zieladresse
-- Senden: Friends&Family und Escrow (Halten, Freigeben, Dispute)
-- Referral: Nutzer erhält eigenen Code, Einladungen zählen
-- 2FA (6-stellig) für kritische Aktionen (Senden, Auszahlen)
-- Support: Nachricht an Admins
-- Stabil: Backoff bei 429/Rate-Limits, klare Fehlerhinweise
+Kompatibel mit: solana==0.25.0  (getestet)
 """
 
 import os, json, time, threading, sqlite3, uuid, random, string, re
@@ -23,7 +13,7 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---- Solana libs: nur solana.* verwenden (kein solders-Keypair) ----
+# ---- Solana libs: solana 0.25.x ----
 from solana.keypair import Keypair
 from solana.publickey import PublicKey
 from solana.system_program import transfer, TransferParams
@@ -106,9 +96,24 @@ def init_db():
         PRIMARY KEY(user_id, source_addr)
     )""")
     conn.commit()
-init_db()
 
+def ensure_system():
+    # System-User (id=0) + SOL-Balance anlegen (für Fees), falls nicht vorhanden
+    r = conn.execute("SELECT 1 FROM users WHERE user_id=0").fetchone()
+    if not r:
+        conn.execute("""INSERT INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,created_at)
+                        VALUES(0,?,?,?,?,?,?,?,?)""",
+                     ("system","","","", DEFAULT_LANG, 0, "R0", None, datetime.now(timezone.utc).isoformat()))
+    # sicherstellen, dass Balance-Zeile existiert
+    for a in ASSETS:
+        b = conn.execute("SELECT 1 FROM balances WHERE user_id=? AND asset=?", (0, a)).fetchone()
+        if not b:
+            conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (0, a))
+    conn.commit()
+
+init_db()
 ASSETS = {"SOL": 9}
+ensure_system()
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def dquant(x, dec): return Decimal(x).quantize(Decimal(10) ** -dec, rounding=ROUND_DOWN)
@@ -123,7 +128,8 @@ def ensure_user(tu, ref_by=None):
                         VALUES(?,?,?,?,?,?,?,?,?)""",
                      (tu.id, tu.username or "", tu.first_name or "", tu.last_name or "",
                       DEFAULT_LANG, 1, code, ref_by, now_iso()))
-        for a in ASSETS: conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tu.id, a))
+        for a in ASSETS:
+            conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tu.id, a))
         conn.commit()
 
 def get_user(uid): return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -131,11 +137,17 @@ def get_user_by_username(u):
     if not u: return None
     return conn.execute("SELECT * FROM users WHERE lower(username)=?", (u.lstrip("@").lower(),)).fetchone()
 def get_username(uid):
+    if uid == 0: return "system"
     r = conn.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
     return (r["username"] or str(uid)) if r else str(uid)
 
 def bal(uid, asset):
     r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
+    # robust: fehlende Zeile automatisch anlegen
+    if not r:
+        conn.execute("INSERT OR IGNORE INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (uid, asset))
+        conn.commit()
+        return Decimal("0"), Decimal("0")
     return Decimal(str(r["available"])), Decimal(str(r["held"]))
 
 def bal_set(uid, asset, av=None, hd=None):
@@ -449,7 +461,7 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     fee = dquant(amt * fee_percent / Decimal("100"), 9)
     net = dquant(amt - fee, 9)
     bal_adj(from_uid, "SOL", da=-amt)
-    bal_adj(0, "SOL", da=fee)
+    bal_adj(0, "SOL", da=fee)  # ← funktioniert jetzt, da user_id=0 existiert
     if mode=="FNF":
         bal_adj(to_uid, "SOL", da=net)
         conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -470,21 +482,18 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
 
 # ------------------ WITHDRAW (echte On-Chain) --------------
 def _extract_latest_blockhash(resp):
-    # robust gegen dict/RPCResponse
     try:
         return resp["result"]["value"]["blockhash"]
     except Exception:
         pass
     try:
-        return resp.value.blockhash  # falls Objekt
+        return resp.value.blockhash
     except Exception:
         pass
     raise RuntimeError(f"unexpected get_latest_blockhash() response: {resp}")
 
 def _extract_sig(resp):
-    # robust gegen dict/RPCResponse
     if isinstance(resp, dict):
-        # je nach solana-py-Version
         if "result" in resp and isinstance(resp["result"], str):
             return resp["result"]
         if "value" in resp and isinstance(resp["value"], str):
@@ -508,13 +517,13 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
         )
     )
     tx.add(instr)
-    # ---- FIX: robustes Lesen des Blockhash + korrektes Signieren ----
+    # Blockhash & FeePayer setzen
     bh_resp = rpc.get_latest_blockhash()
     bh = _extract_latest_blockhash(bh_resp)
     tx.recent_blockhash = bh
     tx.fee_payer = kp.public_key
-    tx.sign(kp)  # <— kein list, kein solders
-    resp = rpc.send_transaction(tx, opts=TxOpts(skip_preflight=False, max_retries=3))
+    # Wichtig für solana 0.25: hier signen lassen
+    resp = rpc.send_transaction(tx, kp, opts=TxOpts(skip_preflight=False, max_retries=3))
     sig = _extract_sig(resp)
     rpc.confirm_transaction(sig)
     return sig
@@ -554,7 +563,6 @@ def wd_amount(m, to_addr):
 
     if u["twofa_enabled"]:
         code=''.join(random.choices(string.digits,k=6))
-        # ---- FIX: Handler an die Prompt-Nachricht binden ----
         msg = bot.reply_to(m, f"🔐 2FA – antworte mit: <code>{code}</code>")
         def check_code(x):
             if (x.text or "").strip()!=code: bot.reply_to(x,"Falscher Code."); return
@@ -578,7 +586,7 @@ def on_cb(c):
     ensure_user(c.from_user)
     data=c.data or ""
 
-    # Spezialfälle zuerst
+    # Senden mit 2FA
     if data.startswith("send:go:"):
         _,_,mode,to_uid,to_uname,amt = data.split(":")
         to_uid=int(to_uid); amt=Decimal(amt)
@@ -586,7 +594,6 @@ def on_cb(c):
         if u["twofa_enabled"]:
             code=''.join(random.choices(string.digits,k=6))
             bot.answer_callback_query(c.id, f"🔐 Code: {code}")
-            # ---- FIX: Handler an die Prompt-Nachricht binden ----
             msg = bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
             def check_code(m):
                 if (m.text or "").strip()!=code: bot.reply_to(m,"Falscher Code."); return
