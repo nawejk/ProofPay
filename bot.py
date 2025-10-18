@@ -118,13 +118,27 @@ def fmt(asset, x): return f"{dquant(Decimal(x), ASSETS[asset])} {asset}"
 def is_admin(uid): return uid in ADMIN_IDS
 
 def ensure_system():
-    # System-User (0) + leeres Balance-Row, damit Gebühren-Buchung nie crasht
-    conn.execute("""INSERT OR IGNORE INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,created_at)
-                    VALUES(0,?,?,?,?,?,?,?,?)""",
-                 ("system","","","", DEFAULT_LANG, 0, "R0", None, now_iso()))
-    for a in ASSETS:
-        conn.execute("INSERT OR IGNORE INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (0, a))
-    conn.commit()
+    # System-User (user_id = 0) anlegen, falls nicht vorhanden
+    r = conn.execute("SELECT 1 FROM users WHERE user_id=0").fetchone()
+    if not r:
+        conn.execute("""
+            INSERT OR IGNORE INTO users(
+                user_id, username, first_name, last_name, lang, twofa_enabled, ref_code, ref_by, created_at
+            ) VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "system",                 # username
+            "",                       # first_name
+            "",                       # last_name
+            DEFAULT_LANG,             # lang
+            0,                        # twofa_enabled (aus)
+            "R0",                     # ref_code
+            None,                     # ref_by
+            now_iso()                 # created_at
+        ))
+        # Systemkonto in balances für alle Assets
+        for a in ASSETS:
+            conn.execute("INSERT OR IGNORE INTO balances(user_id,asset,available,held) VALUES(0, ?, 0, 0)", (a,))
+        conn.commit()
 
 def ensure_user(tu, ref_by=None):
     r = conn.execute("SELECT * FROM users WHERE user_id=?", (tu.id,)).fetchone()
