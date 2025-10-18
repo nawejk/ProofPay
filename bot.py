@@ -32,7 +32,7 @@ from solana.rpc.types import TxOpts
 
 # ------------------ ENV ---------------------
 load_dotenv()
-BOT_TOKEN     = os.getenv("BOT_TOKEN","8222875136:AAFAa9HtRL-g23ganuckjCq5IIW9udQXOZo").strip()
+BOT_TOKEN     = os.getenv("BOT_TOKEN","8222875136:AAEnKHKkjIIgUXRFMwP4p3vuaGihJ6ZxaeQ").strip()
 ADMIN_IDS     = [int(x) for x in os.getenv("ADMIN_IDS","8076025426").split(",") if x.strip().isdigit()]
 DEFAULT_LANG  = os.getenv("DEFAULT_LANG","en").strip().lower()
 SOL_RPC_URL   = os.getenv("SOL_RPC_URL","https://api.mainnet-beta.solana.com").strip()
