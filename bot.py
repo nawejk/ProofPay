@@ -427,6 +427,12 @@ def _extract_latest_blockhash(resp):
     raise RuntimeError(f"unexpected get_latest_blockhash() response: {resp}")
 
 def _extract_sig(resp):
+    # Akzeptiere sowohl dict- als auch Objekt-/String-Varianten.
+    if isinstance(resp, dict):
+        return resp.get("result") or resp.get("value") or resp.get("result", {}).get("value")
+    return resp
+    
+def _extract_sig(resp):
     if isinstance(resp, dict):
         if "result" in resp and isinstance(resp["result"], str):
             return resp["result"]
@@ -439,37 +445,38 @@ def _extract_sig(resp):
     raise RuntimeError(f"unexpected send_transaction() response: {resp}")
 
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
-    # Zieladresse prüfen
+    # 1) Ziel-Adresse prüfen
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
 
     to_pk = PublicKey(to_addr)
 
-    # Transaktion OHNE manuelles Blockhash/Fee-Payer/Signieren bauen
-    tx = Transaction()
-    tx.add(
-        transfer(
-            TransferParams(
-                from_pubkey=kp.public_key,      # Absender = Hot-Wallet
-                to_pubkey=to_pk,                 # Empfänger
-                lamports=int(sol_amt * Decimal(1_000_000_000))
-            )
+    # 2) Transfer-Instruktion bauen
+    ix = transfer(
+        TransferParams(
+            from_pubkey=kp.public_key,  # Absender (Hot-Wallet)
+            to_pubkey=to_pk,            # Empfänger
+            lamports=int(sol_amt * Decimal(1_000_000_000))
         )
     )
 
-    # solana-py 0.25.x: send_transaction holt Blockhash, setzt fee_payer
-    # und signiert intern mit dem/den übergebenen Keypair(s).
-    resp = rpc.send_transaction(
-        tx,
-        kp,                                    # <- WICHTIG: dein Keypair hier übergeben
-        opts=TxOpts(skip_preflight=False, max_retries=5)
-    )
+    # 3) Transaction mit fee_payer = Hot-Wallet
+    tx = Transaction(fee_payer=kp.public_key)
+    tx.add(ix)
 
-    # Signatur robust extrahieren (dict- oder Objekt-Response)
+    # 4) Frisches Blockhash holen (solana==0.25.0 -> dict-Struktur)
+    rb = rpc.get_recent_blockhash()
+    blockhash = rb["result"]["value"]["blockhash"]
+    tx.recent_blockhash = blockhash
+
+    # 5) LOKAL signieren (wichtig: dann gibt’s keine "not enough signers")
+    tx.sign(kp)
+
+    # 6) Raw senden + Signatur extrahieren + bestätigen
+    resp = rpc.send_raw_transaction(tx.serialize(), opts=TxOpts(skip_preflight=False, max_retries=5))
     sig = _extract_sig(resp)
-
-    # (Optional) Bestätigung abwarten
     rpc.confirm_transaction(sig)
+
     return sig
 
 def wd_addr(m):
