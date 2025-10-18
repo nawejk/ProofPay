@@ -3,4 +3,4 @@ python-dotenv==1.0.1
 pytz==2024.1
 requests==2.32.3
 solana==0.25.0
-solders==0.18.1
+solders==0.2.0
