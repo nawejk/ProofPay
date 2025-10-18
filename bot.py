@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 ProofPay – Telegram Bot (SOL on-chain, Auto-Deposit/Auto-Withdraw, Escrow)
-Kompatibel mit: solana==0.25.0  (getestet)
+Kompatibel mit: solana==0.25.0  (wichtig!)
+
+Hauptfeatures:
+- Nutzer-Registrierung, Hauptmenü (DE/EN)
+- Deposit via Source-Wallet-Erkennung
+- On-Chain Withdraw (SOL)
+- Senden: F&F und Escrow (Hold/Release/Dispute)
+- Referral, 2FA, Support
+- Backoff & klare Fehlermeldungen
 """
 
 import os, json, time, threading, sqlite3, uuid, random, string, re
@@ -13,7 +21,8 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---- Solana libs: solana 0.25.x ----
+# -------- Solana (Version 0.25.0) --------
+# ACHTUNG: Diese Imports & API entsprechen solana==0.25.0
 from solana.keypair import Keypair
 from solana.publickey import PublicKey
 from solana.system_program import transfer, TransferParams
@@ -28,8 +37,8 @@ ADMIN_IDS     = [int(x) for x in os.getenv("ADMIN_IDS","8076025426").split(",") 
 DEFAULT_LANG  = os.getenv("DEFAULT_LANG","en").strip().lower()
 SOL_RPC_URL   = os.getenv("SOL_RPC_URL","https://api.mainnet-beta.solana.com").strip()
 
-FEE_FNF = Decimal(os.getenv("FEE_FNF","0.6"))
-FEE_ESCROW_EXTRA = Decimal(os.getenv("FEE_ESCROW_EXTRA","0.2"))
+FEE_FNF = Decimal(os.getenv("FEE_FNF","0.6"))              # %
+FEE_ESCROW_EXTRA = Decimal(os.getenv("FEE_ESCROW_EXTRA","0.2"))  # %
 
 MIN_DEPOSIT_SOL   = Decimal(os.getenv("MIN_DEPOSIT_SOL","0.0005"))
 MIN_WITHDRAW_SOL  = Decimal(os.getenv("MIN_WITHDRAW_SOL","0.0005"))
@@ -44,7 +53,7 @@ if not BOT_TOKEN:
 if not CENTRAL_WALLET_SECRET or not CENTRAL_WALLET_ADDRESS:
     raise SystemExit("CENTRAL_WALLET_SECRET und CENTRAL_WALLET_ADDRESS sind Pflicht.")
 
-# Parse Solana Keypair (64-byte JSON array)
+# Keypair aus 64-Byte Array
 try:
     secret_list = json.loads(CENTRAL_WALLET_SECRET)
     if not (isinstance(secret_list, list) and len(secret_list) == 64):
@@ -55,7 +64,7 @@ try:
 except Exception as e:
     raise SystemExit(f"Ungültiger CENTRAL_WALLET_SECRET: {e}")
 
-# RPC Clients
+# RPC
 rpc  = Client(SOL_RPC_URL)
 sess = requests.Session()
 
@@ -96,28 +105,35 @@ def init_db():
         PRIMARY KEY(user_id, source_addr)
     )""")
     conn.commit()
+init_db()
+
+# System-User/Balances sicherstellen (wichtig für Gebühren!)
+def ensure_system():
+    row = conn.execute("SELECT 1 FROM users WHERE user_id=0").fetchone()
+    if not row:
+        conn.execute(
+            """INSERT INTO users(user_id, username, first_name, last_name, lang, twofa_enabled, ref_code, ref_by, created_at)
+               VALUES(0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("system","","", (DEFAULT_LANG if DEFAULT_LANG in ("de","en") else "en"),
+             0, "R0", None, datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+    # Sprache reparieren
+    row = conn.execute("SELECT lang FROM users WHERE user_id=0").fetchone()
+    if row:
+        lang = row["lang"]
+        if not isinstance(lang, str) or lang.lower() not in ("de","en"):
+            conn.execute("UPDATE users SET lang=? WHERE user_id=0",
+                         ((DEFAULT_LANG if DEFAULT_LANG in ("de","en") else "en"),))
+            conn.commit()
+    # Balance SOL für User 0
+    b = conn.execute("SELECT 1 FROM balances WHERE user_id=0 AND asset='SOL'").fetchone()
+    if not b:
+        conn.execute("INSERT INTO balances(user_id, asset, available, held) VALUES(0,'SOL',0,0)")
+        conn.commit()
+ensure_system()
 
 ASSETS = {"SOL": 9}
-
-def ensure_system():
-    # System-User (id=0) + SOL-Balance anlegen (für Fees), falls nicht vorhanden
-    r = conn.execute("SELECT 1 FROM users WHERE user_id=0").fetchone()
-    if not r:
-        # FIX: 9 Platzhalter (inkl. user_id)
-        conn.execute(
-            """INSERT INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (0, "system", "", "", DEFAULT_LANG, 0, "R0", None, datetime.now(timezone.utc).isoformat())
-        )
-    # sicherstellen, dass Balance-Zeile existiert
-    for a in ASSETS:
-        b = conn.execute("SELECT 1 FROM balances WHERE user_id=? AND asset=?", (0, a)).fetchone()
-        if not b:
-            conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (0, a))
-    conn.commit()
-
-init_db()
-ensure_system()
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def dquant(x, dec): return Decimal(x).quantize(Decimal(10) ** -dec, rounding=ROUND_DOWN)
@@ -131,7 +147,7 @@ def ensure_user(tu, ref_by=None):
         conn.execute("""INSERT INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,created_at)
                         VALUES(?,?,?,?,?,?,?,?,?)""",
                      (tu.id, tu.username or "", tu.first_name or "", tu.last_name or "",
-                      DEFAULT_LANG, 1, code, ref_by, now_iso()))
+                      DEFAULT_LANG if DEFAULT_LANG in ("de","en") else "en", 1, code, ref_by, now_iso()))
         for a in ASSETS: conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tu.id, a))
         conn.commit()
 
@@ -140,17 +156,16 @@ def get_user_by_username(u):
     if not u: return None
     return conn.execute("SELECT * FROM users WHERE lower(username)=?", (u.lstrip("@").lower(),)).fetchone()
 def get_username(uid):
-    if uid == 0: return "system"
     r = conn.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
     return (r["username"] or str(uid)) if r else str(uid)
 
 def bal(uid, asset):
     r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
-    # robust: fehlende Zeile automatisch anlegen
     if not r:
+        # falls Balance fehlt, lege sie an
         conn.execute("INSERT OR IGNORE INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (uid, asset))
         conn.commit()
-        return Decimal("0"), Decimal("0")
+        r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
     return Decimal(str(r["available"])), Decimal(str(r["held"]))
 
 def bal_set(uid, asset, av=None, hd=None):
@@ -166,15 +181,95 @@ def bal_adj(uid, asset, da=Decimal("0"), dh=Decimal("0")):
 
 # ------------------ I18N --------------------
 I18N = {
- # (unverändert, wie bei dir) ...
- "de": { ... },
- "en": { ... }
+ "de":{
+  "welcome": "👋 Willkommen bei <b>ProofPay</b>\n\nSichere Krypto-Zahlungen in Telegram – schnell, günstig und mit Verkäuferschutz.\n\nWähle unten eine Aktion:",
+  "menu":"🏠 <b>Hauptmenü</b>\n\n• 💰 Guthaben ansehen und verwalten\n• ➕ Einzahlen (SOL) – über deine <b>Quelle-Wallet</b>\n• 📤 Senden – Friends & Family oder 🛡️ Escrow\n• ➖ Auszahlen – On-Chain von der Bot-Wallet\n• 🧾 Verlauf – letzte Transaktionen\n• ⚙️ Einstellungen – Sprache & 2FA\n• 🆘 Support – direkt an Admin",
+  "btn_balance":"💰 Guthaben", "btn_deposit":"➕ Einzahlen", "btn_send":"📤 Senden",
+  "btn_withdraw":"➖ Auszahlen", "btn_history":"🧾 Verlauf", "btn_settings":"⚙️ Einstellungen", "btn_support":"🆘 Support",
+  "balance":"<b>Dein Guthaben</b>\n{lines}\n\n📫 <b>Unsere Einzahlungsadresse:</b>\n<code>{addr}</code>\n\nℹ️ Zahle SOL von einer <b>von dir angegebenen Quelle-Wallet</b> auf diese Adresse ein. Wir erkennen die Zahlung automatisch.",
+  "line":"• {asset}: Verfügbar <b>{av}</b> | Einbehalten <b>{hd}</b>",
+  "deposit_ask_source":"➕ <b>Einzahlen (SOL)</b>\n\nSende jetzt die <b>Absender-Wallet-Adresse</b> (deine SOL-Adresse), von der du die Einzahlung schicken wirst.",
+  "deposit_source_ok":"✅ Quelle gespeichert:\n<code>{src}</code>\n\nSende jetzt SOL an unsere Adresse:\n<code>{addr}</code>\n\nMin: {min}\nWir scannen on-chain und schreiben gut, wenn die Zahlung von deiner Quelle kommt.",
+  "send_who":"📤 <b>Senden</b>\nWen möchtest du bezahlen? Antworte mit <code>@username</code>.",
+  "send_amt":"Empfänger: <b>@{u}</b>\nGib Betrag ein, z. B. <code>0.25</code> (Asset: SOL).",
+  "send_mode":"Betrag: <b>{amt}</b> SOL\nWähle den Modus:",
+  "mode_fnf":"👥 Friends & Family",
+  "mode_escrow":"🛡️ Verkäuferschutz (Escrow)",
+  "sent_fnf_sender":"✅ Gesendet an @{u}: {amt} SOL (F&F) – Fee {fee}%",
+  "sent_fnf_recv":"📥 Du hast {amt} SOL von @{u} erhalten (F&F).",
+  "escrow_hold_s":"🛡️ An @{u} gesendet: {amt} SOL – <b>einbehalten</b> bis Freigabe.",
+  "escrow_hold_r":"🛡️ {amt} SOL von @{u} erhalten – <b>einbehalten</b>.",
+  "escrow_btn_release":"✅ Ware erhalten → Freigeben",
+  "escrow_btn_dispute":"❗ Problem melden",
+  "escrow_release_ok":"✅ Escrow freigegeben. Betrag gutgeschrieben.",
+  "escrow_dispute_open":"⚠️ Dispute eröffnet. Admin informiert.",
+  "withdraw_addr":"➖ <b>Auszahlen</b>\nSende Ziel-Adresse (SOL, Base58). Mindestbetrag: {min}",
+  "withdraw_amt":"Gib Betrag in SOL ein (min {min}, max {max}).",
+  "withdraw_ok":"💸 Auszahlung erstellt: {amt} SOL\nTx: <code>{sig}</code>",
+  "history_none":"(Noch keine Transaktionen.)",
+  "settings":"⚙️ <b>Einstellungen</b>\n• Sprache: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Dein Referral-Code: <code>{ref}</code>",
+  "twofa_toggled":"🔐 2FA ist jetzt: {st}",
+  "support_prompt":"🆘 Beschreibe dein Anliegen. Wir antworten hier im Chat.",
+  "deposit_booked":"✅ Einzahlung verbucht: +{amt} SOL\nTx: <code>{sig}</code>",
+  "err_rpc":"RPC überlastet. Bitte kurz später erneut versuchen.",
+  "err_amt":"Ungültiger Betrag.",
+  "err_balance":"Unzureichendes Guthaben. Verfügbar: {av}",
+  "err_addr":"Ungültige SOL-Adresse.",
+  "err_src":"Das ist keine gültige Solana-Adresse."
+ },
+ "en":{
+  "welcome":"👋 Welcome to <b>ProofPay</b>\n\nSecure crypto payments in Telegram — fast, low-fee, with seller protection.\n\nChoose an action:",
+  "menu":"🏠 <b>Main Menu</b>\n\n• 💰 Balance\n• ➕ Deposit (SOL) – from your <b>source wallet</b>\n• 📤 Send — F&F or 🛡️ Escrow\n• ➖ Withdraw — On-Chain\n• 🧾 History\n• ⚙️ Settings — Language & 2FA\n• 🆘 Support",
+  "btn_balance":"💰 Balance", "btn_deposit":"➕ Deposit", "btn_send":"📤 Send",
+  "btn_withdraw":"➖ Withdraw", "btn_history":"🧾 History", "btn_settings":"⚙️ Settings", "btn_support":"🆘 Support",
+  "balance":"<b>Your Balance</b>\n{lines}\n\n📫 <b>Deposit address:</b>\n<code>{addr}</code>\n\nℹ️ Send SOL from a <b>source wallet you’ve provided</b>. We auto-credit once confirmed.",
+  "line":"• {asset}: Available <b>{av}</b> | Held <b>{hd}</b>",
+  "deposit_ask_source":"➕ <b>Deposit (SOL)</b>\n\nPlease send the <b>sender wallet address</b> (your SOL address) you will deposit from.",
+  "deposit_source_ok":"✅ Source saved:\n<code>{src}</code>\n\nNow send SOL to our address:\n<code>{addr}</code>\n\nMin: {min}\nWe’ll scan on-chain and credit only if the payment comes from your source.",
+  "send_who":"📤 <b>Send</b>\nWho do you want to pay? Reply with <code>@username</code>.",
+  "send_amt":"Receiver: <b>@{u}</b>\nEnter amount, e.g. <code>0.25</code> (Asset: SOL).",
+  "send_mode":"Amount: <b>{amt}</b> SOL\nPick a mode:",
+  "mode_fnf":"👥 Friends & Family",
+  "mode_escrow":"🛡️ Seller Protection (Escrow)",
+  "sent_fnf_sender":"✅ Sent to @{u}: {amt} SOL (F&F) – Fee {fee}%",
+  "sent_fnf_recv":"📥 You received {amt} SOL from @{u} (F&F).",
+  "escrow_hold_s":"🛡️ Sent to @{u}: {amt} SOL — <b>held</b>.",
+  "escrow_hold_r":"🛡️ {amt} SOL from @{u} received — <b>held</b>.",
+  "escrow_btn_release":"✅ Item received → Release",
+  "escrow_btn_dispute":"❗ Open dispute",
+  "escrow_release_ok":"✅ Escrow released.",
+  "escrow_dispute_open":"⚠️ Dispute opened. Admin notified.",
+  "withdraw_addr":"➖ <b>Withdraw</b>\nSend target address (SOL, Base58). Minimum: {min}",
+  "withdraw_amt":"Enter amount in SOL (min {min}, max {max}).",
+  "withdraw_ok":"💸 Withdrawal created: {amt} SOL\nTx: <code>{sig}</code>",
+  "history_none":"(No transactions yet.)",
+  "settings":"⚙️ <b>Settings</b>\n• Language: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Your referral code: <code>{ref}</code>",
+  "twofa_toggled":"🔐 2FA is now: {st}",
+  "support_prompt":"🆘 Describe your issue. We’ll reply here.",
+  "deposit_booked":"✅ Deposit credited: +{amt} SOL\nTx: <code>{sig}</code>",
+  "err_rpc":"RPC overloaded. Try again shortly.",
+  "err_amt":"Invalid amount.",
+  "err_balance":"Insufficient balance. Available: {av}",
+  "err_addr":"Invalid SOL address.",
+  "err_src":"That’s not a valid Solana address."
+ }
 }
 
 def T(uid, key, **kw):
-    u = get_user(uid)
-    lang = u["lang"] if u else DEFAULT_LANG
-    return I18N[lang][key].format(**kw)
+    # robuste I18N (verhindert 'set is not subscriptable')
+    try:
+        u = get_user(uid)
+        lang = (u["lang"] if u else DEFAULT_LANG) or DEFAULT_LANG
+        if not isinstance(lang, str):
+            lang = DEFAULT_LANG
+        lang = lang.lower()
+        if lang not in I18N:
+            lang = DEFAULT_LANG if DEFAULT_LANG in I18N else "en"
+        texts = I18N.get(lang, I18N.get("en", {}))
+        template = texts.get(key, I18N.get("en", {}).get(key, key))
+        return template.format(**kw)
+    except Exception:
+        return I18N.get("en", {}).get(key, key)
 
 # ------------------ UI ----------------------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -205,8 +300,7 @@ def safe_edit(chat_id, msg_id, text, reply_markup=None):
 
 # ------------------ RPC helper ----------------
 def rpc_post(method, params):
-    tries=0
-    delay=0.8
+    tries=0; delay=0.8
     while True:
         r = sess.post(SOL_RPC_URL, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=25)
         if r.status_code==429:
@@ -236,8 +330,7 @@ def start(m):
     if m.text and len(m.text.split())>1:
         code=m.text.split()[1].strip()
         if code.startswith("R") and code[1:].isdigit():
-            ref_by=int(code[1:])
-            if ref_by==m.from_user.id: ref_by=None
+            ref_by=int(code[1:]);  ref_by = None if ref_by==m.from_user.id else ref_by
     ensure_user(m.from_user, ref_by=ref_by)
     bot.reply_to(m, T(m.from_user.id,"welcome"), reply_markup=menu(m.from_user.id))
 
@@ -265,8 +358,7 @@ def credit_deposit(uid, sol_amt, sig):
     conn.execute("INSERT INTO tx_log(id,type,user_from,user_to,asset,amount,fee,chain_sig,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                  (str(uuid.uuid4()),"deposit",uid,None,"SOL",float(sol_amt),0,str(sig),"{}",now_iso()))
     conn.commit()
-    try:
-        bot.send_message(uid, T(uid,"deposit_booked", amt=str(sol_amt), sig=sig))
+    try: bot.send_message(uid, T(uid,"deposit_booked", amt=str(sol_amt), sig=sig))
     except: pass
 
 def is_sol_deposit_from_source(tx_result, source_addr: str, dest_addr: str, min_sol: Decimal):
@@ -311,28 +403,22 @@ def scan_deposits_loop():
 
             for s in sigs:
                 sig = s.get("signature") or s.get("sig")
-                if not sig:
-                    continue
-                if conn.execute("SELECT 1 FROM deposit_seen WHERE sig=?", (sig,)).fetchone():
-                    continue
+                if not sig: continue
+                if conn.execute("SELECT 1 FROM deposit_seen WHERE sig=?", (sig,)).fetchone(): continue
 
                 tx = None
                 for attempt in range(5):
                     try:
-                        tx = get_tx(sig)
-                        break
+                        tx = get_tx(sig); break
                     except Exception as e:
-                        if "429" in str(e):
-                            time.sleep(0.6*(attempt+1)); continue
+                        if "429" in str(e): time.sleep(0.6*(attempt+1)); continue
                         tx = None; break
                 if not tx:
                     conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,)); conn.commit()
                     continue
 
                 result = tx
-                ok_src = None
-                amt_sol = Decimal("0")
-
+                ok_src = None; amt_sol = Decimal("0")
                 try:
                     msg = result.get("transaction", {}).get("message", {})
                     for inst in msg.get("instructions", []):
@@ -341,9 +427,7 @@ def scan_deposits_loop():
                             src = info.get("source"); dst=info.get("destination")
                             if dst == CENTRAL_WALLET_ADDRESS and src in expected:
                                 ok, a = is_sol_deposit_from_source(result, src, CENTRAL_WALLET_ADDRESS, MIN_DEPOSIT_SOL)
-                                if ok:
-                                    ok_src = src; amt_sol = a
-                                    break
+                                if ok: ok_src = src; amt_sol = a; break
                 except Exception:
                     pass
 
@@ -395,7 +479,7 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     fee = dquant(amt * fee_percent / Decimal("100"), 9)
     net = dquant(amt - fee, 9)
     bal_adj(from_uid, "SOL", da=-amt)
-    bal_adj(0, "SOL", da=fee)  # Fee in System-Konto (User 0)
+    bal_adj(0, "SOL", da=fee)
     if mode=="FNF":
         bal_adj(to_uid, "SOL", da=net)
         conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -414,130 +498,12 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
         bot.send_message(to_uid, T(to_uid,"escrow_hold_r", u=get_username(from_uid), amt=str(net)))
     conn.commit()
 
-# ------------------ WITHDRAW (echte On-Chain) --------------
-def _extract_latest_blockhash(resp):
-    try:
-        return resp["result"]["value"]["blockhash"]
-    except Exception:
-        pass
-    try:
-        return resp.value.blockhash
-    except Exception:
-        pass
-    raise RuntimeError(f"unexpected get_latest_blockhash() response: {resp}")
-
-def _extract_sig(resp):
-    # Akzeptiere sowohl dict- als auch Objekt-/String-Varianten.
-    if isinstance(resp, dict):
-        return resp.get("result") or resp.get("value") or resp.get("result", {}).get("value")
-    return resp
-    
-def _extract_sig(resp):
-    if isinstance(resp, dict):
-        if "result" in resp and isinstance(resp["result"], str):
-            return resp["result"]
-        if "value" in resp and isinstance(resp["value"], str):
-            return resp["value"]
-    try:
-        return resp.value
-    except Exception:
-        pass
-    raise RuntimeError(f"unexpected send_transaction() response: {resp}")
-
-def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
-    # 1) Ziel-Adresse prüfen
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
-        raise ValueError("invalid address")
-
-    to_pk = PublicKey(to_addr)
-
-    # 2) Transfer-Instruktion bauen
-    ix = transfer(
-        TransferParams(
-            from_pubkey=kp.public_key,  # Absender (Hot-Wallet)
-            to_pubkey=to_pk,            # Empfänger
-            lamports=int(sol_amt * Decimal(1_000_000_000))
-        )
-    )
-
-    # 3) Transaction mit fee_payer = Hot-Wallet
-    tx = Transaction(fee_payer=kp.public_key)
-    tx.add(ix)
-
-    # 4) Frisches Blockhash holen (solana==0.25.0 -> dict-Struktur)
-    rb = rpc.get_recent_blockhash()
-    blockhash = rb["result"]["value"]["blockhash"]
-    tx.recent_blockhash = blockhash
-
-    # 5) LOKAL signieren (wichtig: dann gibt’s keine "not enough signers")
-    tx.sign(kp)
-
-    # 6) Raw senden + Signatur extrahieren + bestätigen
-    resp = rpc.send_raw_transaction(tx.serialize(), opts=TxOpts(skip_preflight=False, max_retries=5))
-    sig = _extract_sig(resp)
-    rpc.confirm_transaction(sig)
-
-    return sig
-
-def wd_addr(m):
-    addr=(m.text or "").strip()
-    if not is_valid_pubkey(addr):
-        bot.reply_to(m, T(m.from_user.id,"err_addr")); return
-    msg=bot.reply_to(m, T(m.from_user.id,"withdraw_amt", min=f"{MIN_WITHDRAW_SOL} SOL", max=f"{MAX_WITHDRAW_SOL} SOL"))
-    bot.register_next_step_handler(msg, lambda x: wd_amount(x, addr))
-
-def wd_amount(m, to_addr):
-    try:
-        amt = Decimal((m.text or "").replace(",",".").strip())
-        if amt<=0 or amt<MIN_WITHDRAW_SOL or amt>MAX_WITHDRAW_SOL: raise ValueError
-    except Exception:
-        bot.reply_to(m, T(m.from_user.id,"err_amt")); return
-    av,_=bal(m.from_user.id, "SOL")
-    if amt>av:
-        bot.reply_to(m, T(m.from_user.id,"err_balance", av=fmt("SOL",av))); return
-
-    u=get_user(m.from_user.id)
-    def finalize():
-        try:
-            sig = withdraw_sol(to_addr, dquant(amt,9))
-        except requests.HTTPError:
-            bot.reply_to(m, T(m.from_user.id,"err_rpc")); return
-        except Exception as e:
-            bot.reply_to(m, f"Auszahlung fehlgeschlagen: {e}"); return
-
-        bal_adj(m.from_user.id, "SOL", da=-amt)
-        meta={"to": to_addr}
-        conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
-                     (str(uuid.uuid4()),"withdraw",m.from_user.id,None,"SOL",float(amt),0,str(sig),json.dumps(meta),now_iso()))
-        conn.commit()
-        bot.reply_to(m, T(m.from_user.id,"withdraw_ok", amt=str(amt), sig=str(sig)), reply_markup=menu(m.from_user.id))
-
-    if u["twofa_enabled"]:
-        code=''.join(random.choices(string.digits,k=6))
-        msg = bot.reply_to(m, f"🔐 2FA – antworte mit: <code>{code}</code>")
-        def check_code(x):
-            if (x.text or "").strip()!=code: bot.reply_to(x,"Falscher Code."); return
-            finalize()
-        bot.register_next_step_handler(msg, check_code)
-    else:
-        finalize()
-
-# ------------------ SUPPORT -------------------
-def sup_msg(m):
-    txt=m.text or "(ohne Text)"
-    for a in ADMIN_IDS:
-        try:
-            bot.send_message(a, f"🆘 Support von @{get_username(m.from_user.id)} ({m.from_user.id}):\n\n{txt}")
-        except: pass
-    bot.reply_to(m, "Danke! Wir melden uns hier im Chat.", reply_markup=menu(m.from_user.id))
-
-# ------------- Callbacks / Screens (catch-all) ------------
+# 2FA-Callbacks & Support im gemeinsamen Handler
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c):
     ensure_user(c.from_user)
     data=c.data or ""
 
-    # Senden mit 2FA
     if data.startswith("send:go:"):
         _,_,mode,to_uid,to_uname,amt = data.split(":")
         to_uid=int(to_uid); amt=Decimal(amt)
@@ -545,11 +511,11 @@ def on_cb(c):
         if u["twofa_enabled"]:
             code=''.join(random.choices(string.digits,k=6))
             bot.answer_callback_query(c.id, f"🔐 Code: {code}")
-            msg = bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
+            bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
             def check_code(m):
                 if (m.text or "").strip()!=code: bot.reply_to(m,"Falscher Code."); return
                 do_send(m.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
-            bot.register_next_step_handler(msg, check_code)
+            bot.register_next_step_handler(c.message, check_code)
         else:
             do_send(c.message.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
         return
@@ -652,6 +618,101 @@ def on_cb(c):
         for a in ADMIN_IDS:
             bot.send_message(a, f"⚠️ Dispute: BUYER @{get_username(tr['user_from'])} vs SELLER @{get_username(tr['user_to'])} | {fmt(tr['asset'],tr['amount'])}\nTxID: {t_id}")
         bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_dispute_open"))
+
+# ------------------ WITHDRAW (echte On-Chain) --------------
+def _extract_sig(resp):
+    # send_raw_transaction kann je nach Client-Wrapper str oder dict liefern
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        return resp.get("result") or resp.get("value") or resp.get("result", {}).get("value")
+    return str(resp)
+
+def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
+    # strikte Adresse prüfen
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
+        raise ValueError("invalid address")
+
+    to_pk = PublicKey(to_addr)
+
+    # Transfer-Instruction
+    ix = transfer(
+        TransferParams(
+            from_pubkey=kp.public_key,
+            to_pubkey=to_pk,
+            lamports=int(sol_amt * Decimal(1_000_000_000))
+        )
+    )
+
+    # Transaction mit gesetztem Fee-Payer
+    tx = Transaction(fee_payer=kp.public_key)
+    tx.add(ix)
+
+    # Blockhash (solana==0.25.0: get_recent_blockhash -> dict)
+    rb = rpc.get_recent_blockhash()
+    blockhash = rb["result"]["value"]["blockhash"]
+    tx.recent_blockhash = blockhash
+
+    # WICHTIG: lokal signieren, dann RAW senden  => verhindert "not enough signers"
+    tx.sign(kp)
+    raw = tx.serialize()
+    resp = rpc.send_raw_transaction(raw, opts=TxOpts(skip_preflight=False, max_retries=5))
+    sig = _extract_sig(resp)
+    # Bestätigen
+    rpc.confirm_transaction(sig)
+    return sig
+
+def wd_addr(m):
+    addr=(m.text or "").strip()
+    if not is_valid_pubkey(addr):
+        bot.reply_to(m, T(m.from_user.id,"err_addr")); return
+    msg=bot.reply_to(m, T(m.from_user.id,"withdraw_amt", min=f"{MIN_WITHDRAW_SOL} SOL", max=f"{MAX_WITHDRAW_SOL} SOL"))
+    bot.register_next_step_handler(msg, lambda x: wd_amount(x, addr))
+
+def wd_amount(m, to_addr):
+    try:
+        amt = Decimal((m.text or "").replace(",",".").strip())
+        if amt<=0 or amt<MIN_WITHDRAW_SOL or amt>MAX_WITHDRAW_SOL: raise ValueError
+    except Exception:
+        bot.reply_to(m, T(m.from_user.id,"err_amt")); return
+    av,_=bal(m.from_user.id, "SOL")
+    if amt>av:
+        bot.reply_to(m, T(m.from_user.id,"err_balance", av=fmt("SOL",av))); return
+
+    u=get_user(m.from_user.id)
+    def finalize():
+        try:
+            sig = withdraw_sol(to_addr, dquant(amt,9))
+        except requests.HTTPError:
+            bot.reply_to(m, T(m.from_user.id,"err_rpc")); return
+        except Exception as e:
+            bot.reply_to(m, f"Auszahlung fehlgeschlagen: {e}"); return
+
+        bal_adj(m.from_user.id, "SOL", da=-amt)
+        meta={"to": to_addr}
+        conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (str(uuid.uuid4()),"withdraw",m.from_user.id,None,"SOL",float(amt),0,str(sig),json.dumps(meta),now_iso()))
+        conn.commit()
+        bot.reply_to(m, T(m.from_user.id,"withdraw_ok", amt=str(amt), sig=str(sig)), reply_markup=menu(m.from_user.id))
+
+    if u["twofa_enabled"]:
+        code=''.join(random.choices(string.digits,k=6))
+        bot.reply_to(m, f"🔐 2FA – antworte mit: <code>{code}</code>")
+        def check_code(x):
+            if (x.text or "").strip()!=code: bot.reply_to(x,"Falscher Code."); return
+            finalize()
+        bot.register_next_step_handler(m, check_code)
+    else:
+        finalize()
+
+# ------------------ SUPPORT -------------------
+def sup_msg(m):
+    txt=m.text or "(ohne Text)"
+    for a in ADMIN_IDS:
+        try:
+            bot.send_message(a, f"🆘 Support von @{get_username(m.from_user.id)} ({m.from_user.id}):\n\n{txt}")
+        except: pass
+    bot.reply_to(m, "Danke! Wir melden uns hier im Chat.", reply_markup=menu(m.from_user.id))
 
 # ------------------ FALLBACK ------------------
 @bot.message_handler(content_types=["text","photo","document","sticker","video","audio","voice"])
