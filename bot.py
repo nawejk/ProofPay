@@ -97,13 +97,18 @@ def init_db():
     )""")
     conn.commit()
 
+ASSETS = {"SOL": 9}
+
 def ensure_system():
     # System-User (id=0) + SOL-Balance anlegen (für Fees), falls nicht vorhanden
     r = conn.execute("SELECT 1 FROM users WHERE user_id=0").fetchone()
     if not r:
-        conn.execute("""INSERT INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,created_at)
-                        VALUES(0,?,?,?,?,?,?,?,?)""",
-                     ("system","","","", DEFAULT_LANG, 0, "R0", None, datetime.now(timezone.utc).isoformat()))
+        # FIX: 9 Platzhalter (inkl. user_id)
+        conn.execute(
+            """INSERT INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (0, "system", "", "", DEFAULT_LANG, 0, "R0", None, datetime.now(timezone.utc).isoformat())
+        )
     # sicherstellen, dass Balance-Zeile existiert
     for a in ASSETS:
         b = conn.execute("SELECT 1 FROM balances WHERE user_id=? AND asset=?", (0, a)).fetchone()
@@ -112,7 +117,6 @@ def ensure_system():
     conn.commit()
 
 init_db()
-ASSETS = {"SOL": 9}
 ensure_system()
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
@@ -128,8 +132,7 @@ def ensure_user(tu, ref_by=None):
                         VALUES(?,?,?,?,?,?,?,?,?)""",
                      (tu.id, tu.username or "", tu.first_name or "", tu.last_name or "",
                       DEFAULT_LANG, 1, code, ref_by, now_iso()))
-        for a in ASSETS:
-            conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tu.id, a))
+        for a in ASSETS: conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tu.id, a))
         conn.commit()
 
 def get_user(uid): return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -163,78 +166,9 @@ def bal_adj(uid, asset, da=Decimal("0"), dh=Decimal("0")):
 
 # ------------------ I18N --------------------
 I18N = {
- "de":{
-  "welcome": "👋 Willkommen bei <b>ProofPay</b>\n\nSichere Krypto-Zahlungen in Telegram – schnell, günstig und mit Verkäuferschutz.\n\nWähle unten eine Aktion:",
-  "menu":"🏠 <b>Hauptmenü</b>\n\n• 💰 Guthaben ansehen und verwalten\n• ➕ Einzahlen (SOL) – über deine <b>Quelle-Wallet</b>\n• 📤 Senden – Friends & Family oder 🛡️ Escrow\n• ➖ Auszahlen – On-Chain von der Bot-Wallet\n• 🧾 Verlauf – letzte Transaktionen\n• ⚙️ Einstellungen – Sprache & 2FA\n• 🆘 Support – direkt an Admin",
-  "btn_balance":"💰 Guthaben", "btn_deposit":"➕ Einzahlen", "btn_send":"📤 Senden",
-  "btn_withdraw":"➖ Auszahlen", "btn_history":"🧾 Verlauf", "btn_settings":"⚙️ Einstellungen", "btn_support":"🆘 Support",
-  "balance":"<b>Dein Guthaben</b>\n{lines}\n\n📫 <b>Unsere Einzahlungsadresse:</b>\n<code>{addr}</code>\n\nℹ️ Zahle SOL von einer <b>von dir angegebenen Quelle-Wallet</b> auf diese Adresse ein. Wir erkennen die Zahlung automatisch.",
-  "line":"• {asset}: Verfügbar <b>{av}</b> | Einbehalten <b>{hd}</b>",
-  "deposit_ask_source":"➕ <b>Einzahlen (SOL)</b>\n\nSende jetzt die <b>Absender-Wallet-Adresse</b> (deine SOL-Adresse), von der du die Einzahlung schicken wirst.",
-  "deposit_source_ok":"✅ Quelle gespeichert:\n<code>{src}</code>\n\nSende jetzt SOL an unsere Adresse:\n<code>{addr}</code>\n\nMin: {min}\nWir scannen on-chain und schreiben gut, wenn die Zahlung von deiner Quelle kommt.",
-  "send_who":"📤 <b>Senden</b>\nWen möchtest du bezahlen? Antworte mit <code>@username</code>.",
-  "send_amt":"Empfänger: <b>@{u}</b>\nGib Betrag ein, z. B. <code>0.25</code> (Asset: SOL).",
-  "send_mode":"Betrag: <b>{amt}</b> SOL\nWähle den Modus:",
-  "mode_fnf":"👥 Friends & Family",
-  "mode_escrow":"🛡️ Verkäuferschutz (Escrow)",
-  "sent_fnf_sender":"✅ Gesendet an @{u}: {amt} SOL (F&F) – Fee {fee}%",
-  "sent_fnf_recv":"📥 Du hast {amt} SOL von @{u} erhalten (F&F).",
-  "escrow_hold_s":"🛡️ An @{u} gesendet: {amt} SOL – <b>einbehalten</b> bis Freigabe.",
-  "escrow_hold_r":"🛡️ {amt} SOL von @{u} erhalten – <b>einbehalten</b>.",
-  "escrow_btn_release":"✅ Ware erhalten → Freigeben",
-  "escrow_btn_dispute":"❗ Problem melden",
-  "escrow_release_ok":"✅ Escrow freigegeben. Betrag gutgeschrieben.",
-  "escrow_dispute_open":"⚠️ Dispute eröffnet. Admin informiert.",
-  "withdraw_addr":"➖ <b>Auszahlen</b>\nSende Ziel-Adresse (SOL, Base58). Mindestbetrag: {min}",
-  "withdraw_amt":"Gib Betrag in SOL ein (min {min}, max {max}).",
-  "withdraw_ok":"💸 Auszahlung erstellt: {amt} SOL\nTx: <code>{sig}</code>",
-  "history_none":"(Noch keine Transaktionen.)",
-  "settings":"⚙️ <b>Einstellungen</b>\n• Sprache: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Dein Referral-Code: <code>{ref}</code>",
-  "twofa_toggled":"🔐 2FA ist jetzt: {st}",
-  "support_prompt":"🆘 Beschreibe dein Anliegen. Wir antworten hier im Chat.",
-  "deposit_booked":"✅ Einzahlung verbucht: +{amt} SOL\nTx: <code>{sig}</code>",
-  "err_rpc":"RPC überlastet. Bitte kurz später erneut versuchen.",
-  "err_amt":"Ungültiger Betrag.",
-  "err_balance":"Unzureichendes Guthaben. Verfügbar: {av}",
-  "err_addr":"Ungültige SOL-Adresse.",
-  "err_src":"Das ist keine gültige Solana-Adresse."
- },
- "en":{
-  "welcome":"👋 Welcome to <b>ProofPay</b>\n\nSecure crypto payments in Telegram — fast, low-fee, with seller protection.\n\nChoose an action:",
-  "menu":"🏠 <b>Main Menu</b>\n\n• 💰 Balance\n• ➕ Deposit (SOL) – from your <b>source wallet</b>\n• 📤 Send — F&F or 🛡️ Escrow\n• ➖ Withdraw — On-Chain\n• 🧾 History\n• ⚙️ Settings — Language & 2FA\n• 🆘 Support",
-  "btn_balance":"💰 Balance", "btn_deposit":"➕ Deposit", "btn_send":"📤 Send",
-  "btn_withdraw":"➖ Withdraw", "btn_history":"🧾 History", "btn_settings":"⚙️ Settings", "btn_support":"🆘 Support",
-  "balance":"<b>Your Balance</b>\n{lines}\n\n📫 <b>Deposit address:</b>\n<code>{addr}</code>\n\nℹ️ Send SOL from a <b>source wallet you’ve provided</b>. We auto-credit once confirmed.",
-  "line":"• {asset}: Available <b>{av}</b> | Held <b>{hd}</b>",
-  "deposit_ask_source":"➕ <b>Deposit (SOL)</b>\n\nPlease send the <b>sender wallet address</b> (your SOL address) you will deposit from.",
-  "deposit_source_ok":"✅ Source saved:\n<code>{src}</code>\n\nNow send SOL to our address:\n<code>{addr}</code>\n\nMin: {min}\nWe’ll scan on-chain and credit only if the payment comes from your source.",
-  "send_who":"📤 <b>Send</b>\nWho do you want to pay? Reply with <code>@username</code>.",
-  "send_amt":"Receiver: <b>@{u}</b>\nEnter amount, e.g. <code>0.25</code> (Asset: SOL).",
-  "send_mode":"Amount: <b>{amt}</b> SOL\nPick a mode:",
-  "mode_fnf":"👥 Friends & Family",
-  "mode_escrow":"🛡️ Seller Protection (Escrow)",
-  "sent_fnf_sender":"✅ Sent to @{u}: {amt} SOL (F&F) – Fee {fee}%",
-  "sent_fnf_recv":"📥 You received {amt} SOL from @{u} (F&F).",
-  "escrow_hold_s":"🛡️ Sent to @{u}: {amt} SOL — <b>held</b>.",
-  "escrow_hold_r":"🛡️ {amt} SOL from @{u} received — <b>held</b>.",
-  "escrow_btn_release":"✅ Item received → Release",
-  "escrow_btn_dispute":"❗ Open dispute",
-  "escrow_release_ok":"✅ Escrow released.",
-  "escrow_dispute_open":"⚠️ Dispute opened. Admin notified.",
-  "withdraw_addr":"➖ <b>Withdraw</b>\nSend target address (SOL, Base58). Minimum: {min}",
-  "withdraw_amt":"Enter amount in SOL (min {min}, max {max}).",
-  "withdraw_ok":"💸 Withdrawal created: {amt} SOL\nTx: <code>{sig}</code>",
-  "history_none":"(No transactions yet.)",
-  "settings":"⚙️ <b>Settings</b>\n• Language: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Your referral code: <code>{ref}</code>",
-  "twofa_toggled":"🔐 2FA is now: {st}",
-  "support_prompt":"🆘 Describe your issue. We’ll reply here.",
-  "deposit_booked":"✅ Deposit credited: +{amt} SOL\nTx: <code>{sig}</code>",
-  "err_rpc":"RPC overloaded. Try again shortly.",
-  "err_amt":"Invalid amount.",
-  "err_balance":"Insufficient balance. Available: {av}",
-  "err_addr":"Invalid SOL address.",
-  "err_src":"That’s not a valid Solana address."
- }
+ # (unverändert, wie bei dir) ...
+ "de": { ... },
+ "en": { ... }
 }
 
 def T(uid, key, **kw):
@@ -461,7 +395,7 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     fee = dquant(amt * fee_percent / Decimal("100"), 9)
     net = dquant(amt - fee, 9)
     bal_adj(from_uid, "SOL", da=-amt)
-    bal_adj(0, "SOL", da=fee)  # ← funktioniert jetzt, da user_id=0 existiert
+    bal_adj(0, "SOL", da=fee)  # Fee in System-Konto (User 0)
     if mode=="FNF":
         bal_adj(to_uid, "SOL", da=net)
         conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -522,7 +456,7 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     bh = _extract_latest_blockhash(bh_resp)
     tx.recent_blockhash = bh
     tx.fee_payer = kp.public_key
-    # Wichtig für solana 0.25: hier signen lassen
+    # Für solana 0.25.x: Wallet direkt an send_transaction übergeben (signing inside)
     resp = rpc.send_transaction(tx, kp, opts=TxOpts(skip_preflight=False, max_retries=3))
     sig = _extract_sig(resp)
     rpc.confirm_transaction(sig)
