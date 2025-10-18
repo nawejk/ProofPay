@@ -1,892 +1,626 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Pay Telegram Bot – Solana (SOL, USDC, USDT) mit:
-- Zentrale Wallet (Custody), Einzahlungen per RPC (gratis), automatische Verbuchung
-- Interne Konten (available/held)
-- Friends & Family & Verkäuferschutz (Escrow)
-- 2FA-Bestätigung (optional)
-- Multi-Asset (SOL/USDC/USDT – SPL)
-- Sprachumschaltung (de/en)
-- Gebührenmodell (percentage + fixed) + eigene Escrow-Gebühr
-- Referral-System (Anteil der Plattformgebühr an Werber)
-- Auszahlungen AUTOMATISCH on-chain (SOL & SPL) – Bot signiert mit zentralem Secret Key
-- Support-Chat & Admin-Panel
-- SQLite als Storage
+ProofPay – Telegram Bot (SOL on-chain, Auto-Deposit/Auto-Withdraw, Escrow)
+Kompatibel mit: solana==0.30.2, solders==0.18.1
+
+Hauptfeatures:
+- Nutzer-Registrierung, schönes Hauptmenü (DE/EN)
+- Einzahlungen: pro Nutzer eindeutiger Deposit-Tag (Memo) -> On-Chain-Scan -> Auto-Gutschrift + Benachrichtigung
+- Auszahlungen: echte SOL-Transaktion von Bot-Hotwallet -> Zieladresse
+- Senden: Friends&Family und Escrow (Halten, Freigeben, Dispute)
+- Referral: Nutzer erhält eigenen Code, Einladungen zählen
+- 2FA (6-stellig) für kritische Aktionen (Senden, Auszahlen)
+- Support: Nachricht an Admins
+- Stabil: Backoff bei 429/Rate-Limits, klare Fehlerhinweise
+
+WICHTIG:
+- Du brauchst einen funktionierenden RPC-Endpoint (am besten mit API-Key)
+- CENTRAL_WALLET_SECRET muss 64-Byte ed25519 JSON-Array sein (Solana Keypair export)
 """
 
-import os, re, json, uuid, random, string, sqlite3, requests, base64
-from datetime import datetime, timezone
+import os, json, time, threading, sqlite3, uuid, random, string, re
 from decimal import Decimal, ROUND_DOWN
-
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---------- Konfiguration ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8222875136:AAFAa9HtRL-g23ganuckjCq5IIW9udQXOZo")
-ADMIN_IDS = [123456789]  # int IDs
-SOL_RPC_URL = os.getenv("SOL_RPC_URL", "https://api.mainnet-beta.solana.com")
-
-CENTRAL_WALLET_ADDRESS = os.getenv("CENTRAL_WALLET_ADDRESS", "3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy")
-# Base58-encoded 64-byte secret (ed25519). Niemals hardcoden – nutze ENV!
-CENTRAL_WALLET_SECRET = os.getenv("CENTRAL_WALLET_SECRET", "3sBeqpypNPzPASEYnuoURGCjFHtYnArGvfHos4kBbnCem9xX4X3TU8J51cGEpH7FBoVHF2H99oAwUqBzievSZvRM")
-
-APP_NAME = "KryptoPayBot"
-DEFAULT_LANG = "de"
-CURRENCY_SOL = "SOL"
-ASSETS = {
-    "SOL": {"type":"SOL", "decimals":9},
-    "USDC": {
-        "type":"SPL",
-        "mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-        "decimals":6
-    },
-    "USDT": {
-        "type":"SPL",
-        "mint":"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-        "decimals":6
-    }
-}
-
-# Gebühren (Plattform) – Prozent in %, Fixed in Asset-Einheiten (optional)
-FEE_PERCENT = 0.6          # auf Transfers (F&F u. Escrow), wird vom Betrag abgezogen
-FEE_FIXED = 0.0            # z.B. 0.0005 SOL – pro Transfer (optional)
-ESCROW_EXTRA_FEE_PERCENT = 0.2   # zusätzl. Prozent bei Verkäuferschutz
-WITHDRAW_FEE_PERCENT = 0.0  # interne Service-Gebühr bei Auszahlung (nicht Network-Fee)
-WITHDRAW_FEE_FIXED = 0.0
-
-# Referral – Anteil der eingenommenen Plattformgebühr an den Werber
-REFERRAL_REBATE_PERCENT = 25.0  # z.B. 25% der Plattformgebühr gehen an Werber
-
-# ---------- Libraries für Solana Transaktionen ----------
+# ---- Solana libs (für echte Auszahlung) ----
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey as PublicKey
+from solders.system_program import transfer, TransferParams
 from solana.rpc.api import Client
-from solana.publickey import PublicKey
-from solana.keypair import Keypair
 from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
-from solana.system_program import TransferParams, transfer
-from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
-from spl.token.instructions import (
-    get_associated_token_address, create_associated_token_account, transfer_checked,
-)
 
-sol_client = Client(SOL_RPC_URL)
+# ------------------ ENV ---------------------
+load_dotenv()
+BOT_TOKEN     = os.getenv("BOT_TOKEN","8222875136:AAFAa9HtRL-g23ganuckjCq5IIW9udQXOZo").strip()
+ADMIN_IDS     = [int(x) for x in os.getenv("ADMIN_IDS","8076025426").split(",") if x.strip().isdigit()]
+DEFAULT_LANG  = os.getenv("DEFAULT_LANG","en").strip().lower()
+SOL_RPC_URL   = os.getenv("SOL_RPC_URL","https://api.mainnet-beta.solana.com").strip()
 
-# ---------- Bot ----------
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+FEE_FNF = Decimal(os.getenv("FEE_FNF","0.6"))
+FEE_ESCROW_EXTRA = Decimal(os.getenv("FEE_ESCROW_EXTRA","0.2"))
 
-# ---------- DB ----------
-DB = "cryptopay_v2.db"
+MIN_DEPOSIT_SOL = Decimal(os.getenv("MIN_DEPOSIT_SOL","0.0005"))
+MIN_WITHDRAW_SOL = Decimal(os.getenv("MIN_WITHDRAW_SOL","0.0005"))
+MAX_WITHDRAW_SOL = Decimal(os.getenv("MAX_WITHDRAW_SOL","50"))
+
+DEPOSIT_POLL_SECONDS = int(os.getenv("DEPOSIT_POLL_SECONDS","15"))
+
+CENTRAL_WALLET_SECRET = os.getenv("CENTRAL_WALLET_SECRET","[216,228,184,240,28,208,86,251,72,207,66,95,46,213,227,92,3,151,107,135,207,35,239,106,204,30,183,73,9,76,39,133,231,92,227,79,168,2,181,228,68,217,227,49,92,136,161,209,206,110,146,237,79,243,145,54,121,109,106,22,160,136,164,90]").strip()
+CENTRAL_WALLET_ADDRESS = os.getenv("CENTRAL_WALLET_ADDRESS","Ga9L4teyfbnJcxhhErKAquF8cHy3GR6XPF1sqxji3DN9").strip()
+
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN fehlt in .env")
+if not CENTRAL_WALLET_SECRET or not CENTRAL_WALLET_ADDRESS:
+    raise SystemExit("CENTRAL_WALLET_SECRET und CENTRAL_WALLET_ADDRESS sind Pflicht.")
+
+# Parse Solana Keypair (64-byte JSON array)
+try:
+    secret_list = json.loads(CENTRAL_WALLET_SECRET)
+    if not (isinstance(secret_list, list) and len(secret_list) in (64, 32)):
+        raise ValueError
+    # solders erwartet 64 Bytes (secret+pub). Bei 32: nicht ausreichend -> sauberer Fehler
+    if len(secret_list) == 32:
+        raise ValueError("CENTRAL_WALLET_SECRET ist 32 Bytes. Bitte 64-Byte JSON-Array (solana-keygen) verwenden.")
+    kp = Keypair.from_bytes(bytes(secret_list))
+    if str(kp.pubkey()) != CENTRAL_WALLET_ADDRESS:
+        # kein harter Abbruch – aber warnen
+        print("WARN: CENTRAL_WALLET_ADDRESS stimmt nicht mit Secret überein. Bitte prüfen.")
+except Exception as e:
+    raise SystemExit(f"Ungültiger CENTRAL_WALLET_SECRET: {e}")
+
+# RPC Clients
+rpc = Client(SOL_RPC_URL)           # solana-py Client (für send_transaction, blockhash)
+sess = requests.Session()           # raw JSON-RPC für Reads (günstig & schneller Backoff)
+
+# ------------------ DB ----------------------
+DB="proofpay.db"
 conn = sqlite3.connect(DB, check_same_thread=False)
 conn.row_factory = sqlite3.Row
 
 def init_db():
     c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-      user_id INTEGER PRIMARY KEY,
-      username TEXT,
-      first_name TEXT,
-      last_name TEXT,
-      created_at TEXT,
-      lang TEXT DEFAULT 'de',
-      source_wallet TEXT,
-      twofa_enabled INTEGER DEFAULT 1,
-      twofa_payload TEXT,
-      referrer_id INTEGER
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS balances(
-      user_id INTEGER,
-      asset TEXT,
-      available REAL DEFAULT 0,
-      held REAL DEFAULT 0,
-      PRIMARY KEY(user_id, asset)
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS deposits(
-      id TEXT PRIMARY KEY,
-      user_id INTEGER,
-      asset TEXT,
-      tx_sig TEXT UNIQUE,
-      from_address TEXT,
-      amount REAL,
-      created_at TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS transfers(
-      id TEXT PRIMARY KEY,
-      type TEXT,              -- FNF|ESCROW
-      asset TEXT,
-      from_user INTEGER,
-      to_user INTEGER,
-      amount REAL,            -- brutto
-      fee_taken REAL,         -- gebühr in asset
-      status TEXT,            -- completed|held|released|reversed
-      created_at TEXT,
-      released_at TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS fees_ledger(
-      id TEXT PRIMARY KEY,
-      transfer_id TEXT,
-      asset TEXT,
-      amount REAL,
-      created_at TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS referrals(
-      id TEXT PRIMARY KEY,
-      transfer_id TEXT,
-      referrer_id INTEGER,
-      referee_id INTEGER,
-      asset TEXT,
-      rebate_amount REAL,
-      created_at TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS withdrawals(
-      id TEXT PRIMARY KEY,
-      user_id INTEGER,
-      asset TEXT,
-      to_address TEXT,      -- SOL: Pubkey; SPL: user ATA wird automatisch genommen/erstellt
-      amount REAL,          -- brutto user-wunsch
-      fee_taken REAL,       -- interne service-gebühr
-      status TEXT,          -- pending|paid|rejected|error
-      tx_sig TEXT,
-      error TEXT,
-      created_at TEXT,
-      updated_at TEXT
-    );
-    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT, first_name TEXT, last_name TEXT,
+        lang TEXT DEFAULT 'de',
+        twofa_enabled INTEGER DEFAULT 1,
+        ref_code TEXT, ref_by INTEGER,
+        deposit_tag TEXT,       -- eindeutiges Memo pro Nutzer
+        created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS balances(
+        user_id INTEGER, asset TEXT, available REAL DEFAULT 0, held REAL DEFAULT 0,
+        PRIMARY KEY(user_id,asset)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS tx_log(
+        id TEXT PRIMARY KEY,
+        type TEXT,          -- deposit|send|escrow_hold|escrow_release|withdraw
+        user_from INTEGER, user_to INTEGER,
+        asset TEXT, amount REAL, fee REAL,
+        chain_sig TEXT, meta TEXT,
+        created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS deposit_seen(
+        sig TEXT PRIMARY KEY
+    )""")
     conn.commit()
-
 init_db()
 
-# ---------- Helpers ----------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+ASSETS = {"SOL": 9}
 
-def dquant(x, decimals):
-    q = Decimal(10) ** -decimals
-    return Decimal(x).quantize(q, rounding=ROUND_DOWN)
+def now_iso(): return datetime.now(timezone.utc).isoformat()
+def dquant(x, dec): return Decimal(x).quantize(Decimal(10) ** -dec, rounding=ROUND_DOWN)
+def fmt(asset, x): return f"{dquant(Decimal(x), ASSETS[asset])} {asset}"
+def is_admin(uid): return uid in ADMIN_IDS
+
+def ensure_user(tu, ref_by=None):
+    r = conn.execute("SELECT * FROM users WHERE user_id=?", (tu.id,)).fetchone()
+    if not r:
+        # simpler Referral-Code
+        code = f"R{tu.id}"
+        tag = f"U{tu.id}"
+        conn.execute("""INSERT INTO users(user_id,username,first_name,last_name,lang,twofa_enabled,ref_code,ref_by,deposit_tag,created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                     (tu.id, tu.username or "", tu.first_name or "", tu.last_name or "",
+                      DEFAULT_LANG, 1, code, ref_by, tag, now_iso()))
+        for a in ASSETS: conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tu.id, a))
+        conn.commit()
 
 def get_user(uid): return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-
-def ensure_user(tg_user, ref=None):
-    row = get_user(tg_user.id)
-    if not row:
-        conn.execute("INSERT INTO users(user_id,username,first_name,last_name,created_at,lang,referrer_id) VALUES(?,?,?,?,?,?,?)",
-                     (tg_user.id, tg_user.username or "", tg_user.first_name or "", tg_user.last_name or "", now_iso(), DEFAULT_LANG, ref))
-        for a in ASSETS.keys():
-            conn.execute("INSERT INTO balances(user_id,asset,available,held) VALUES(?,?,0,0)", (tg_user.id, a))
-        conn.commit()
-    else:
-        # update username names
-        conn.execute("UPDATE users SET username=?, first_name=?, last_name=? WHERE user_id=?",
-                     (tg_user.username or "", tg_user.first_name or "", tg_user.last_name or "", tg_user.id))
-        conn.commit()
-
-def get_balance(uid, asset):
-    r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
-    if not r: return Decimal("0"), Decimal("0")
-    return Decimal(str(r["available"])), Decimal(str(r["held"]))
-
-def set_balance(uid, asset, avail=None, held=None):
-    av, hd = get_balance(uid, asset)
-    if avail is None: avail = av
-    if held is None: held = hd
-    conn.execute("UPDATE balances SET available=?, held=? WHERE user_id=? AND asset=?",
-                 (float(avail), float(held), uid, asset))
-    conn.commit()
-
-def adj_balance(uid, asset, delta_av=Decimal("0"), delta_hd=Decimal("0")):
-    av, hd = get_balance(uid, asset)
-    set_balance(uid, asset, av+delta_av, hd+delta_hd)
-
-def fmt_amount(asset, x):
-    dec = ASSETS[asset]["decimals"]
-    return f"{dquant(x, dec)} {asset}"
-
-def is_admin(uid): return int(uid) in ADMIN_IDS
-
-def gen_code(n=6): return ''.join(random.choices(string.digits, k=n))
-
-def get_user_by_username(username):
-    if not username: return None
-    u = username.lstrip("@").lower()
-    return conn.execute("SELECT * FROM users WHERE lower(username)=?", (u,)).fetchone()
-
+def get_user_by_username(u):
+    if not u: return None
+    return conn.execute("SELECT * FROM users WHERE lower(username)=?", (u.lstrip("@").lower(),)).fetchone()
 def get_username(uid):
     r = conn.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
-    return r["username"] if r and r["username"] else str(uid)
+    return (r["username"] or str(uid)) if r else str(uid)
 
-# ---------- i18n ----------
+def bal(uid, asset):
+    r = conn.execute("SELECT available,held FROM balances WHERE user_id=? AND asset=?", (uid, asset)).fetchone()
+    return Decimal(str(r["available"])), Decimal(str(r["held"]))
+
+def bal_set(uid, asset, av=None, hd=None):
+    a,h = bal(uid, asset)
+    if av is None: av = a
+    if hd is None: hd = h
+    conn.execute("UPDATE balances SET available=?, held=? WHERE user_id=? AND asset=?",
+                 (float(av), float(hd), uid, asset)); conn.commit()
+
+def bal_adj(uid, asset, da=Decimal("0"), dh=Decimal("0")):
+    a,h = bal(uid, asset)
+    bal_set(uid, asset, a+da, h+dh)
+
+# ------------------ I18N --------------------
 I18N = {
-    "de": {
-        "welcome": "Willkommen bei <b>{app}</b>! Zentrale Wallet:\n<code>{addr}</code>\n\n⚠️ Nur von <b>Phantom/DEX</b> einzahlen – <u>keine</u> Börsen.\n",
-        "menu": "Wähle eine Funktion:",
-        "btn_balance": "💰 Guthaben",
-        "btn_deposit": "➕ Einzahlen",
-        "btn_withdraw": "➖ Auszahlen",
-        "btn_send": "📤 Senden",
-        "btn_history": "🧾 Verlauf",
-        "btn_settings": "⚙️ Einstellungen",
-        "btn_support": "🆘 Support",
-        "balance": "💰 <b>Guthaben</b>\n{lines}",
-        "line_balance": "{asset}: Verfügbar <b>{av}</b> | Einbehalten <b>{hd}</b>",
-        "deposit_title": "➕ <b>Einzahlen</b> – Asset wählen:",
-        "deposit_instr": "Absender-Adresse: <code>{src}</code>\nZentrale Wallet: <code>{central}</code>\n⚠️ Nur Phantom/DEX; keine Börsen!",
-        "set_src_prompt": "Sende mir jetzt <b>deine Absender-Wallet</b> (Solana-Adresse).",
-        "check_dep_none": "Keine neuen Einzahlungen gefunden.",
-        "send_who": "Wem möchtest du senden? Antworte mit <code>@username</code>.",
-        "send_amount": "Empfänger: <b>@{u}</b>\nGib Betrag und Asset an, z. B. <code>0.5 SOL</code> oder <code>10 USDC</code>.",
-        "send_mode": "Betrag: <b>{amt}</b>\nWähle den Sendemodus:",
-        "mode_fnf": "👥 Friends & Family",
-        "mode_escrow": "🛡️ Verkäuferschutz",
-        "confirm": "Bestätigen?\nEmpfänger: <b>@{to}</b>\nBetrag: <b>{amt}</b>\nModus: <b>{mode}</b>\nGebühr: <b>{fee}</b>",
-        "need_src": "Bitte zuerst eine Absender-Adresse in den Einzahlungs-Einstellungen setzen.",
-        "withdraw_addr": "➖ <b>Auszahlen</b>\nSende die Ziel-Adresse (Solana-Pubkey). Für USDC/USDT wird das ATA automatisch erzeugt.",
-        "withdraw_amount": "Gib Betrag und Asset an (z. B. <code>0.05 SOL</code> oder <code>10 USDT</code>).",
-        "withdraw_created": "✅ Auszahlungsauftrag erstellt und wird on-chain ausgeführt.",
-        "withdraw_done": "💸 Auszahlung gesendet: <code>{tx}</code>",
-        "withdraw_err": "❌ Auszahlung fehlgeschlagen: {e}",
-        "settings": "⚙️ <b>Einstellungen</b>\n• Sprache: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Absender-Adresse: <code>{src}</code>",
-        "toggle_2fa": "🔐 2-Stufen-Bestätigung: {state}",
-        "lang_switched": "Sprache gesetzt auf: {lang}",
-        "support_prompt": "🆘 <b>Support</b>\nSchildere dein Anliegen.",
-        "history_none": "🧾 Kein Verlauf.",
-        "history_line": "{dir} {amt} mit @{other} | {mode} | {status}",
-        "seller_shipped_buyer": "📦 Verkäufer meldet: versendet. Bitte bestätige bei Erhalt.",
-        "escrow_held_sender": "🛡️ Gesendet an <b>@{to}</b>: {amt} (einbehalten)",
-        "escrow_held_receiver": "🛡️ {amt} von <b>@{from}</b> eingegangen – <b>einbehalten</b>.",
-        "fnf_sent_sender": "✅ Gesendet an <b>@{to}</b>: {amt} (Friends & Family)",
-        "fnf_sent_receiver": "📥 Du hast {amt} von <b>@{from}</b> erhalten (Friends & Family).",
-        "release_ok": "✅ Freigabe erteilt.",
-        "dispute_opened": "Dispute eröffnet. Admin informiert.",
-        "btn_back": "⬅️ Zurück",
-    },
-    "en": {
-        "welcome": "Welcome to <b>{app}</b>! Central wallet:\n<code>{addr}</code>\n\n⚠️ Deposit only from <b>Phantom/DEX</b> – <u>no</u> exchanges.\n",
-        "menu": "Choose an option:",
-        "btn_balance": "💰 Balance",
-        "btn_deposit": "➕ Deposit",
-        "btn_withdraw": "➖ Withdraw",
-        "btn_send": "📤 Send",
-        "btn_history": "🧾 History",
-        "btn_settings": "⚙️ Settings",
-        "btn_support": "🆘 Support",
-        "balance": "💰 <b>Your Balance</b>\n{lines}",
-        "line_balance": "{asset}: Available <b>{av}</b> | Held <b>{hd}</b>",
-        "deposit_title": "➕ <b>Deposit</b> – Choose asset:",
-        "deposit_instr": "Source address: <code>{src}</code>\nCentral wallet: <code>{central}</code>\n⚠️ Phantom/DEX only; no exchanges!",
-        "set_src_prompt": "Send me your <b>source wallet</b> (Solana address).",
-        "check_dep_none": "No new deposits found.",
-        "send_who": "Who to send? Reply with <code>@username</code>.",
-        "send_amount": "Receiver: <b>@{u}</b>\nSend amount and asset, e.g. <code>0.5 SOL</code> or <code>10 USDC</code>.",
-        "send_mode": "Amount: <b>{amt}</b>\nChoose sending mode:",
-        "mode_fnf": "👥 Friends & Family",
-        "mode_escrow": "🛡️ Seller Protection",
-        "confirm": "Confirm?\nTo: <b>@{to}</b>\nAmount: <b>{amt}</b>\nMode: <b>{mode}</b>\nFee: <b>{fee}</b>",
-        "need_src": "Please set a source address in deposit settings first.",
-        "withdraw_addr": "➖ <b>Withdraw</b>\nSend target Solana address. For USDC/USDT ATA will be created automatically.",
-        "withdraw_amount": "Send amount and asset (e.g. <code>0.05 SOL</code> or <code>10 USDT</code>).",
-        "withdraw_created": "✅ Withdrawal created and will be executed on-chain.",
-        "withdraw_done": "💸 Withdrawal sent: <code>{tx}</code>",
-        "withdraw_err": "❌ Withdrawal failed: {e}",
-        "settings": "⚙️ <b>Settings</b>\n• Language: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Source address: <code>{src}</code>",
-        "toggle_2fa": "🔐 Two-factor: {state}",
-        "lang_switched": "Language set to: {lang}",
-        "support_prompt": "🆘 <b>Support</b>\nDescribe your issue.",
-        "history_none": "🧾 No history.",
-        "history_line": "{dir} {amt} with @{other} | {mode} | {status}",
-        "seller_shipped_buyer": "📦 Seller says: shipped. Please confirm on delivery.",
-        "escrow_held_sender": "🛡️ Sent to <b>@{to}</b>: {amt} (held)",
-        "escrow_held_receiver": "🛡️ {amt} from <b>@{from}</b> received – <b>held</b>.",
-        "fnf_sent_sender": "✅ Sent to <b>@{to}</b>: {amt} (Friends & Family)",
-        "fnf_sent_receiver": "📥 You received {amt} from <b>@{from}</b> (Friends & Family).",
-        "release_ok": "✅ Released.",
-        "dispute_opened": "Dispute opened. Admin notified.",
-        "btn_back": "⬅️ Back",
-    }
+ "de":{
+  "welcome": "👋 Willkommen bei <b>ProofPay</b>\n\nSichere Krypto-Zahlungen in Telegram – schnell, günstig und mit Verkäuferschutz.\n\nWähle unten eine Aktion:",
+  "menu":"🏠 <b>Hauptmenü</b>\n\n• 💰 Guthaben ansehen und verwalten\n• ➕ Einzahlen (SOL) – eindeutiger Memo-Tag\n• 📤 Senden – Friends & Family oder 🛡️ Escrow\n• ➖ Auszahlen – On-Chain von der Bot-Wallet\n• 🧾 Verlauf – letzte Transaktionen\n• ⚙️ Einstellungen – Sprache & 2FA\n• 🆘 Support – direkt an Admin",
+  "btn_balance":"💰 Guthaben", "btn_deposit":"➕ Einzahlen", "btn_send":"📤 Senden",
+  "btn_withdraw":"➖ Auszahlen", "btn_history":"🧾 Verlauf", "btn_settings":"⚙️ Einstellungen", "btn_support":"🆘 Support",
+  "balance":"<b>Dein Guthaben</b>\n{lines}\n\n🔗 <b>Dein Einzahlungs-Tag (Memo):</b> <code>{tag}</code>\n📫 <b>Empfangsadresse (zentral):</b> <code>{addr}</code>\nℹ️ Schicke SOL an die Adresse und trage <b>Memo={tag}</b> ein. Eingang wird automatisch verbucht.",
+  "line":"• {asset}: Verfügbar <b>{av}</b> | Einbehalten <b>{hd}</b>",
+  "deposit_info":"➕ <b>Einzahlen (SOL)</b>\n\n1) Wallet: <code>{addr}</code>\n2) Memo/Tag: <code>{tag}</code>\n3) Mindestbetrag: {min}\n\nNach Bestätigung on-chain wirst du automatisch benachrichtigt.",
+  "send_who":"📤 <b>Senden</b>\nWen möchtest du bezahlen? Antworte mit <code>@username</code>.",
+  "send_amt":"Empfänger: <b>@{u}</b>\nGib Betrag ein, z. B. <code>0.25</code> (Asset: SOL).",
+  "send_mode":"Betrag: <b>{amt}</b> SOL\nWähle den Modus:",
+  "mode_fnf":"👥 Friends & Family",
+  "mode_escrow":"🛡️ Verkäuferschutz (Escrow)",
+  "sent_fnf_sender":"✅ Gesendet an @{u}: {amt} SOL (F&F) – Fee {fee}%",
+  "sent_fnf_recv":"📥 Du hast {amt} SOL von @{u} erhalten (F&F).",
+  "escrow_hold_s":"🛡️ An @{u} gesendet: {amt} SOL – <b>einbehalten</b> bis Freigabe.",
+  "escrow_hold_r":"🛡️ {amt} SOL von @{u} erhalten – <b>einbehalten</b>.",
+  "escrow_btn_release":"✅ Ware erhalten → Freigeben",
+  "escrow_btn_dispute":"❗ Problem melden",
+  "escrow_release_ok":"✅ Escrow freigegeben. Betrag gutgeschrieben.",
+  "escrow_dispute_open":"⚠️ Dispute eröffnet. Admin informiert.",
+  "withdraw_addr":"➖ <b>Auszahlen</b>\nSende Ziel-Adresse (SOL, Base58). Mindestbetrag: {min}",
+  "withdraw_amt":"Gib Betrag in SOL ein (min {min}, max {max}).",
+  "withdraw_ok":"💸 Auszahlung erstellt: {amt} SOL\nTx: <code>{sig}</code>",
+  "history_none":"(Noch keine Transaktionen.)",
+  "settings":"⚙️ <b>Einstellungen</b>\n• Sprache: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Dein Referral-Code: <code>{ref}</code>",
+  "twofa_toggled":"🔐 2FA ist jetzt: {st}",
+  "support_prompt":"🆘 Beschreibe dein Anliegen. Wir antworten hier im Chat.",
+  "deposit_booked":"✅ Einzahlung verbucht: +{amt} SOL\nTx: <code>{sig}</code>",
+  "err_rpc":"RPC überlastet. Bitte kurz später erneut versuchen.",
+  "err_amt":"Ungültiger Betrag.",
+  "err_balance":"Unzureichendes Guthaben. Verfügbar: {av}",
+  "err_addr":"Ungültige SOL-Adresse.",
+ },
+ "en":{
+  "welcome":"👋 Welcome to <b>ProofPay</b>\n\nSecure crypto payments in Telegram — fast, low-fee, with seller protection.\n\nChoose an action:",
+  "menu":"🏠 <b>Main Menu</b>\n\n• 💰 Balance\n• ➕ Deposit (SOL) – unique memo tag\n• 📤 Send — F&F or 🛡️ Escrow\n• ➖ Withdraw — On-Chain\n• 🧾 History\n• ⚙️ Settings — Language & 2FA\n• 🆘 Support",
+  "btn_balance":"💰 Balance", "btn_deposit":"➕ Deposit", "btn_send":"📤 Send",
+  "btn_withdraw":"➖ Withdraw", "btn_history":"🧾 History", "btn_settings":"⚙️ Settings", "btn_support":"🆘 Support",
+  "balance":"<b>Your Balance</b>\n{lines}\n\n🔗 <b>Your deposit tag (memo):</b> <code>{tag}</code>\n📫 <b>Deposit address:</b> <code>{addr}</code>\nℹ️ Send SOL to the address with <b>memo={tag}</b>. We credit automatically after confirmation.",
+  "line":"• {asset}: Available <b>{av}</b> | Held <b>{hd}</b>",
+  "deposit_info":"➕ <b>Deposit (SOL)</b>\n\n1) Wallet: <code>{addr}</code>\n2) Memo/Tag: <code>{tag}</code>\n3) Minimum: {min}\n\nWe notify you automatically after on-chain confirmation.",
+  "send_who":"📤 <b>Send</b>\nWho do you want to pay? Reply with <code>@username</code>.",
+  "send_amt":"Receiver: <b>@{u}</b>\nEnter amount, e.g. <code>0.25</code> (Asset: SOL).",
+  "send_mode":"Amount: <b>{amt}</b> SOL\nPick a mode:",
+  "mode_fnf":"👥 Friends & Family",
+  "mode_escrow":"🛡️ Seller Protection (Escrow)",
+  "sent_fnf_sender":"✅ Sent to @{u}: {amt} SOL (F&F) – Fee {fee}%",
+  "sent_fnf_recv":"📥 You received {amt} SOL from @{u} (F&F).",
+  "escrow_hold_s":"🛡️ Sent to @{u}: {amt} SOL — <b>held</b>.",
+  "escrow_hold_r":"🛡️ {amt} SOL from @{u} received — <b>held</b>.",
+  "escrow_btn_release":"✅ Item received → Release",
+  "escrow_btn_dispute":"❗ Open dispute",
+  "escrow_release_ok":"✅ Escrow released.",
+  "escrow_dispute_open":"⚠️ Dispute opened. Admin notified.",
+  "withdraw_addr":"➖ <b>Withdraw</b>\nSend target address (SOL, Base58). Minimum: {min}",
+  "withdraw_amt":"Enter amount in SOL (min {min}, max {max}).",
+  "withdraw_ok":"💸 Withdrawal created: {amt} SOL\nTx: <code>{sig}</code>",
+  "history_none":"(No transactions yet.)",
+  "settings":"⚙️ <b>Settings</b>\n• Language: <b>{lang}</b>\n• 2FA: <b>{twofa}</b>\n• Your referral code: <code>{ref}</code>",
+  "twofa_toggled":"🔐 2FA is now: {st}",
+  "support_prompt":"🆘 Describe your issue. We’ll reply here.",
+  "deposit_booked":"✅ Deposit credited: +{amt} SOL\nTx: <code>{sig}</code>",
+  "err_rpc":"RPC overloaded. Try again shortly.",
+  "err_amt":"Invalid amount.",
+  "err_balance":"Insufficient balance. Available: {av}",
+  "err_addr":"Invalid SOL address.",
+ }
 }
 
-def T(uid_or_lang, key, **kw):
-    if isinstance(uid_or_lang, str):
-        lang = uid_or_lang
-    else:
-        row = get_user(uid_or_lang)
-        lang = row["lang"] if row else DEFAULT_LANG
+def T(uid, key, **kw):
+    u = get_user(uid)
+    lang = u["lang"] if u else DEFAULT_LANG
     return I18N[lang][key].format(**kw)
 
-# ---------- RPC helpers ----------
-def rpc(method, params):
-    r = requests.post(SOL_RPC_URL, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=25)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j: raise RuntimeError(j["error"])
-    return j["result"]
+# ------------------ UI ----------------------
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+def menu(uid):
+    u = get_user(uid)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_balance"], callback_data="m:bal"))
+    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_deposit"], callback_data="m:dep"),
+           InlineKeyboardButton(I18N[u["lang"]]["btn_send"], callback_data="m:send"))
+    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_withdraw"], callback_data="m:wd"),
+           InlineKeyboardButton(I18N[u["lang"]]["btn_history"], callback_data="m:hist"))
+    kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_settings"], callback_data="m:set"),
+           InlineKeyboardButton(I18N[u["lang"]]["btn_support"], callback_data="m:sup"))
+    return kb
+
+# ------------------ RPC helper ----------------
+def rpc_post(method, params):
+    # Backoff bei 429/Rate-Limits
+    tries=0
+    delay=0.8
+    while True:
+        r = sess.post(SOL_RPC_URL, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=25)
+        if r.status_code==429:
+            tries+=1
+            if tries>6: raise requests.HTTPError("429 Too Many Requests")
+            time.sleep(min(delay,5)); delay*=1.6; continue
+        r.raise_for_status()
+        j=r.json()
+        if "error" in j:
+            # -32005 ist oft rate limit / data too large
+            if j["error"].get("code") in (-32005,):
+                tries+=1
+                if tries>6: raise RuntimeError(j["error"])
+                time.sleep(min(delay,5)); delay*=1.6; continue
+            raise RuntimeError(j["error"])
+        return j["result"]
 
 def get_sigs_for(addr, limit=50):
-    return rpc("getSignaturesForAddress", [addr, {"limit": limit}]) or []
+    return rpc_post("getSignaturesForAddress", [addr, {"limit": limit}]) or []
 
 def get_tx(sig):
-    return rpc("getTransaction", [sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}])
+    return rpc_post("getTransaction", [sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}])
 
-def central_keypair():
-    from base58 import b58decode
-    raw = b58decode(CENTRAL_WALLET_SECRET)
-    return Keypair.from_secret_key(raw)
-
-def central_pubkey():
-    return PublicKey(CENTRAL_WALLET_ADDRESS)
-
-def asset_dec(asset): return ASSETS[asset]["decimals"]
-
-def central_ata(asset):
-    mint = PublicKey(ASSETS[asset]["mint"])
-    return get_associated_token_address(central_pubkey(), mint)
-
-# ---------- UI ----------
-def main_menu(uid):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(T(uid, "btn_balance"), callback_data="m:bal"))
-    kb.add(InlineKeyboardButton(T(uid, "btn_deposit"), callback_data="m:dep"),
-           InlineKeyboardButton(T(uid, "btn_withdraw"), callback_data="m:wd"))
-    kb.add(InlineKeyboardButton(T(uid, "btn_send"), callback_data="m:send"),
-           InlineKeyboardButton(T(uid, "btn_history"), callback_data="m:hist"))
-    kb.add(InlineKeyboardButton(T(uid, "btn_settings"), callback_data="m:set"),
-           InlineKeyboardButton(T(uid, "btn_support"), callback_data="m:sup"))
-    return kb
-
-def asset_menu(uid, back_tag):
-    kb = InlineKeyboardMarkup()
-    for a in ASSETS.keys():
-        kb.add(InlineKeyboardButton(a, callback_data=f"asset:{back_tag}:{a}"))
-    kb.add(InlineKeyboardButton(T(uid,"btn_back"), callback_data="m:home"))
-    return kb
-
-# ---------- Start / Referral ----------
+# ------------------ Commands ------------------
 @bot.message_handler(commands=["start"])
-def cmd_start(m):
-    ref = None
-    if " " in m.text:
-        q = m.text.split(" ",1)[1]
-        if q.startswith("ref="):
-            try:
-                ref = int(q.split("=",1)[1])
-                if ref == m.from_user.id: ref = None
-            except: ref=None
-    ensure_user(m.from_user, ref=ref)
-    bot.send_message(m.chat.id, T(m.from_user.id,"welcome", app=APP_NAME, addr=CENTRAL_WALLET_ADDRESS))
-    bot.send_message(m.chat.id, T(m.from_user.id,"menu"), reply_markup=main_menu(m.from_user.id))
+def start(m):
+    # Referral? /start R123
+    ref_by=None
+    if m.text and len(m.text.split())>1:
+        code=m.text.split()[1].strip()
+        if code.startswith("R") and code[1:].isdigit():
+            ref_by=int(code[1:])
+            if ref_by==m.from_user.id: ref_by=None
+    ensure_user(m.from_user, ref_by=ref_by)
+    bot.reply_to(m, T(m.from_user.id,"welcome"), reply_markup=menu(m.from_user.id))
 
-# ---------- Callbacks ----------
-@bot.callback_query_handler(func=lambda c: True)
-def on_cb(c: CallbackQuery):
-    data = c.data
-    if data == "m:home":
-        bot.edit_message_text(T(c.from_user.id,"menu"), c.message.chat.id, c.message.message_id, reply_markup=main_menu(c.from_user.id))
-    elif data == "m:bal":
-        lines=[]
-        for a in ASSETS.keys():
-            av, hd = get_balance(c.from_user.id, a)
-            lines.append(T(c.from_user.id,"line_balance", asset=a, av=fmt_amount(a,av), hd=fmt_amount(a,hd)))
-        bot.edit_message_text(T(c.from_user.id,"balance", lines="\n".join(lines)), c.message.chat.id, c.message.message_id, reply_markup=main_menu(c.from_user.id))
-    elif data == "m:dep":
-        kb = asset_menu(c.from_user.id, "dep")
-        bot.edit_message_text(T(c.from_user.id,"deposit_title"), c.message.chat.id, c.message.message_id, reply_markup=kb)
-    elif data.startswith("asset:dep:"):
-        asset = data.split(":")[2]
-        u = get_user(c.from_user.id)
-        src = u["source_wallet"] or "—"
-        txt = T(c.from_user.id,"deposit_instr", src=src, central=CENTRAL_WALLET_ADDRESS) + f"\nAsset: <b>{asset}</b>"
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🏷 Source-Adresse setzen/ändern", callback_data=f"dep:setsrc"))
-        kb.add(InlineKeyboardButton("🧾 Einzahlung prüfen", callback_data=f"dep:check:{asset}"))
-        kb.add(InlineKeyboardButton(T(c.from_user.id,"btn_back"), callback_data="m:home"))
-        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
-    elif data == "dep:setsrc":
-        msg = bot.send_message(c.message.chat.id, T(c.from_user.id,"set_src_prompt"))
-        bot.register_next_step_handler(msg, on_set_source_wallet)
-    elif data.startswith("dep:check:"):
-        asset = data.split(":")[2]
-        u = get_user(c.from_user.id)
-        if not u["source_wallet"]:
-            bot.answer_callback_query(c.id, T(c.from_user.id,"need_src"), show_alert=True); return
-        booked, total = check_and_book_deposits(c.from_user.id, u["source_wallet"], asset)
-        if booked:
-            lines = [f"✔️ {len(booked)} Tx – Summe: {fmt_amount(asset, total)}"]
-            for b in booked:
-                lines.append(f"• {fmt_amount(asset, Decimal(str(b['amount'])))} | {b['tx'][:8]}…")
-            bot.edit_message_text("\n".join(lines), c.message.chat.id, c.message.message_id, reply_markup=main_menu(c.from_user.id))
-        else:
-            bot.edit_message_text(T(c.from_user.id,"check_dep_none"), c.message.chat.id, c.message.message_id, reply_markup=main_menu(c.from_user.id))
-    elif data == "m:send":
-        msg = bot.send_message(c.message.chat.id, T(c.from_user.id,"send_who"))
-        bot.register_next_step_handler(msg, on_send_user)
-    elif data == "m:hist":
-        txt = render_history(c.from_user.id)
-        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=main_menu(c.from_user.id))
-    elif data == "m:wd":
-        msg = bot.send_message(c.message.chat.id, T(c.from_user.id,"withdraw_addr"))
-        bot.register_next_step_handler(msg, on_withdraw_addr)
-    elif data == "m:set":
-        u = get_user(c.from_user.id)
-        twofa = "AN" if u["twofa_enabled"] else "AUS"
-        txt = T(c.from_user.id,"settings", lang=u["lang"], twofa=twofa, src=u["source_wallet"] or "—")
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔐 2FA AN/AUS", callback_data="set:2fa"))
-        kb.add(InlineKeyboardButton("🌐 Sprache: Deutsch", callback_data="set:lang:de"),
-               InlineKeyboardButton("🌐 Language: English", callback_data="set:lang:en"))
-        kb.add(InlineKeyboardButton("🏷 Source-Adresse", callback_data="dep:setsrc"))
-        kb.add(InlineKeyboardButton(T(c.from_user.id,"btn_back"), callback_data="m:home"))
-        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
-    elif data == "set:2fa":
-        u = get_user(c.from_user.id)
-        val = 0 if u["twofa_enabled"] else 1
-        conn.execute("UPDATE users SET twofa_enabled=? WHERE user_id=?", (val, c.from_user.id)); conn.commit()
-        bot.answer_callback_query(c.id, T(c.from_user.id,"toggle_2fa", state=("AN" if val else "AUS")))
-        on_cb(CallbackQuery(id=c.id, from_user=c.from_user, message=c.message, data="m:set"))
-    elif data.startswith("set:lang:"):
-        lang = data.split(":")[2]
-        conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, c.from_user.id)); conn.commit()
-        bot.answer_callback_query(c.id, T(lang,"lang_switched", lang=("Deutsch" if lang=="de" else "English")))
-        bot.edit_message_text(T(lang,"menu"), c.message.chat.id, c.message.message_id, reply_markup=main_menu(c.from_user.id))
-    elif data.startswith("esc:"):
-        # handled via dedicated handlers below
-        pass
-
-# ---------- Step handlers ----------
-def on_set_source_wallet(m):
-    ensure_user(m.from_user)
-    a = m.text.strip()
-    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", a):
-        bot.reply_to(m, "Das ist keine gültige Solana-Adresse.")
-        return
-    conn.execute("UPDATE users SET source_wallet=? WHERE user_id=?", (a, m.from_user.id)); conn.commit()
-    bot.reply_to(m, f"✅ Gespeichert.\nZentrale Wallet:\n<code>{CENTRAL_WALLET_ADDRESS}</code>\n⚠️ Keine Börsen benutzen.")
-
-def parse_amount_asset(text):
-    # e.g. "0.5 SOL" / "10 usdc"
-    parts = text.strip().replace(",", ".").split()
-    if len(parts) == 1:
-        return Decimal(parts[0]), "SOL"
-    amt = Decimal(parts[0])
-    asset = parts[1].upper()
-    if asset not in ASSETS: raise ValueError("asset")
-    return amt, asset
-
-def on_send_user(m):
-    ensure_user(m.from_user)
-    u = m.text.strip().lstrip("@")
-    row = get_user_by_username(u)
-    if not row:
-        bot.reply_to(m, f"Kein Nutzer @${u} gefunden (Empfänger muss /start ausführen)."); return
-    if row["user_id"] == m.from_user.id:
-        bot.reply_to(m, "Du kannst dir selbst nichts senden."); return
-    bot.reply_to(m, T(m.from_user.id,"send_amount", u=u))
-    bot.register_next_step_handler(m, lambda x: on_send_amount(x, row["user_id"], u))
-
-def on_send_amount(m, to_uid, to_uname):
-    try:
-        amt, asset = parse_amount_asset(m.text)
-        if amt <= 0: raise ValueError()
-    except Exception:
-        bot.reply_to(m, "Ungültiger Betrag/Asset."); return
-    av, _ = get_balance(m.from_user.id, asset)
-    if amt > av:
-        bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_amount(asset,av)}"); return
-    # Gebühren berechnen
-    fee_percent = Decimal(str(FEE_PERCENT)) + (Decimal(str(ESCROW_EXTRA_FEE_PERCENT)))
-    # Mode wählen
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(T(m.from_user.id,"mode_fnf"), callback_data=f"send:mode:FNF:{to_uid}:{to_uname}:{amt}:{asset}"),
-           InlineKeyboardButton(T(m.from_user.id,"mode_escrow"), callback_data=f"send:mode:ESCROW:{to_uid}:{to_uname}:{amt}:{asset}"))
-    kb.add(InlineKeyboardButton(T(m.from_user.id,"btn_back"), callback_data="m:home"))
-    bot.reply_to(m, T(m.from_user.id,"send_mode", amt=f"{fmt_amount(asset,amt)}"))
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("send:mode:"))
-def on_send_mode(c):
-    _,_,mode,to_uid,to_uname,amt,asset = c.data.split(":")
-    amt = Decimal(amt); to_uid = int(to_uid)
-    # tatsächliche Gebühren:
-    p = Decimal(str(FEE_PERCENT))
-    extra = Decimal("0")
-    if mode=="ESCROW":
-        extra = Decimal(str(ESCROW_EXTRA_FEE_PERCENT))
-    fee = (amt * (p+extra) / Decimal("100")) + Decimal(str(FEE_FIXED))
-    fee = dquant(fee, ASSETS[asset]["decimals"])
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("✅ OK", callback_data=f"send:go:{mode}:{to_uid}:{to_uname}:{amt}:{asset}:{fee}"),
-           InlineKeyboardButton(T(c.from_user.id,"btn_back"), callback_data="m:home"))
-    bot.edit_message_text(T(c.from_user.id,"confirm", to=to_uname, amt=f"{fmt_amount(asset,amt)}",
-                            mode=("Friends & Family" if mode=="FNF" else "Escrow"),
-                            fee=f"{fmt_amount(asset,fee)}"),
-                          c.message.chat.id, c.message.message_id, reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("send:go:"))
-def on_send_go(c):
-    _,_,mode,to_uid,to_uname,amt,asset,fee = c.data.split(":")
-    to_uid = int(to_uid); amt = Decimal(amt); fee = Decimal(fee)
-    u = get_user(c.from_user.id)
-    payload = {"stage":"send","mode":mode,"to":to_uid,"amount":str(amt),"asset":asset,"fee":str(fee)}
-    if u["twofa_enabled"]:
-        code = gen_code()
-        payload["code"]=code
-        conn.execute("UPDATE users SET twofa_payload=? WHERE user_id=?", (json.dumps(payload), c.from_user.id)); conn.commit()
-        bot.edit_message_text(f"🔐 Code: <code>{code}</code> – antworte mit dem Code zur Bestätigung.", c.message.chat.id, c.message.message_id)
-        bot.register_next_step_handler(c.message, lambda m: confirm_send_code(m, payload))
-    else:
-        perform_send(c.message.chat.id, c.from_user.id, payload)
-
-def confirm_send_code(m, payload):
-    if m.text.strip() != payload.get("code"):
-        bot.reply_to(m, "Falscher Code."); conn.execute("UPDATE users SET twofa_payload=NULL WHERE user_id=?", (m.from_user.id,)); conn.commit(); return
-    perform_send(m.chat.id, m.from_user.id, payload)
-    conn.execute("UPDATE users SET twofa_payload=NULL WHERE user_id=?", (m.from_user.id,)); conn.commit()
-
-def perform_send(chat_id, from_uid, payload):
-    mode = payload["mode"]; to_uid = int(payload["to"]); amt = Decimal(payload["amount"]); asset = payload["asset"]; fee = Decimal(payload["fee"])
-    av,_ = get_balance(from_uid, asset)
-    if amt > av:
-        bot.send_message(chat_id, "Unzureichendes Guthaben."); return
-    # Gebühren abziehen, Netto an Empfänger
-    net = dquant(amt - fee, ASSETS[asset]["decimals"])
-    if net <= 0:
-        bot.send_message(chat_id, "Betrag zu klein nach Gebühren."); return
-    # Abzüge beim Sender
-    adj_balance(from_uid, asset, delta_av=-amt)
-    t_id = str(uuid.uuid4())
-    # Plattformgebühr verbuchen
-    conn.execute("INSERT INTO fees_ledger(id, transfer_id, asset, amount, created_at) VALUES(?,?,?,?,?)",
-                 (str(uuid.uuid4()), t_id, asset, float(fee), now_iso()))
-    # Referral Rebate (aus der Gebühr)
-    ref = get_user(from_uid)["referrer_id"]
-    if ref and ref != to_uid and ref != from_uid:
-        rebate = dquant((fee * Decimal(str(REFERRAL_REBATE_PERCENT)) / Decimal("100")), ASSETS[asset]["decimals"])
-        if rebate > 0:
-            adj_balance(ref, asset, delta_av=rebate)
-            conn.execute("INSERT INTO referrals(id,transfer_id,referrer_id,referee_id,asset,rebate_amount,created_at) VALUES(?,?,?,?,?,?,?)",
-                         (str(uuid.uuid4()), t_id, ref, from_uid, asset, float(rebate), now_iso()))
-            # Plattformgebühr reduziert sich nicht intern (du kannst sie so oder so buchen) – hier lassen wir sie separat.
-
-    if mode=="FNF":
-        adj_balance(to_uid, asset, delta_av=net)
-        status="completed"
-    else:
-        adj_balance(to_uid, asset, delta_hd=net)
-        status="held"
-    conn.execute("INSERT INTO transfers(id,type,asset,from_user,to_user,amount,fee_taken,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                 (t_id, mode, asset, from_uid, to_uid, float(amt), float(fee), status, now_iso()))
-    conn.commit()
-    if mode=="FNF":
-        bot.send_message(chat_id, T(from_uid,"fnf_sent_sender", to=get_username(to_uid), amt=fmt_amount(asset,net)))
-        bot.send_message(to_uid, T(to_uid, "fnf_sent_receiver", sender=get_username(from_uid), amt=fmt_amount(asset, net)))
-    else:
-        kb_sender = InlineKeyboardMarkup()
-        kb_sender.add(InlineKeyboardButton("✅ Ware erhalten → Freigeben", callback_data=f"esc:release:{t_id}"),
-                      InlineKeyboardButton("❗ Problem melden", callback_data=f"esc:dispute:{t_id}"))
-        bot.send_message(chat_id, T(from_uid,"escrow_held_sender", to=get_username(to_uid), amt=fmt_amount(asset,net)), reply_markup=kb_sender)
-        kb_recv = InlineKeyboardMarkup()
-        kb_recv.add(InlineKeyboardButton("📦 Ich habe versendet", callback_data=f"esc:shipped:{t_id}"))
-        bot.send_message(to_uid, T(to_uid,"escrow_held_receiver", from=get_username(from_uid), amt=fmt_amount(asset,net)), reply_markup=kb_recv)
-
-# Escrow Actions
-@bot.callback_query_handler(func=lambda c: c.data.startswith("esc:release:"))
-def esc_release(c):
-    t_id = c.data.split(":")[2]
-    tr = conn.execute("SELECT * FROM transfers WHERE id=?", (t_id,)).fetchone()
-    if not tr or tr["type"]!="ESCROW" or tr["from_user"]!=c.from_user.id or tr["status"]!="held":
-        bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
-    u = get_user(c.from_user.id)
-    if u["twofa_enabled"]:
-        code = gen_code()
-        conn.execute("UPDATE users SET twofa_payload=? WHERE user_id=?", (json.dumps({"stage":"escrow","id":t_id,"code":code}), c.from_user.id)); conn.commit()
-        bot.send_message(c.message.chat.id, f"🔐 Code: <code>{code}</code> – antworte zur Bestätigung.")
-        bot.register_next_step_handler(c.message, lambda m: esc_release_code(m, t_id, code))
-    else:
-        do_release(t_id); bot.answer_callback_query(c.id, T(c.from_user.id,"release_ok"))
-
-def esc_release_code(m, t_id, code):
-    row = get_user(m.from_user.id)
-    payload = row["twofa_payload"]
-    if not payload: return
-    p = json.loads(payload)
-    if m.text.strip()!=p.get("code"): bot.reply_to(m,"Falscher Code."); return
-    do_release(t_id); conn.execute("UPDATE users SET twofa_payload=NULL WHERE user_id=?", (m.from_user.id,)); conn.commit()
-    bot.reply_to(m, T(m.from_user.id,"release_ok"))
-
-def do_release(t_id):
-    tr = conn.execute("SELECT * FROM transfers WHERE id=?", (t_id,)).fetchone()
-    if not tr or tr["status"]!="held": return
-    asset = tr["asset"]; amt = Decimal(str(tr["amount"])) - Decimal(str(tr["fee_taken"]))
-    # Move held -> available for receiver
-    av, hd = get_balance(tr["to_user"], asset)
-    if hd < amt: return
-    set_balance(tr["to_user"], asset, avail=av+amt, held=hd-amt)
-    conn.execute("UPDATE transfers SET status='released', released_at=? WHERE id=?", (now_iso(), t_id)); conn.commit()
-    bot.send_message(tr["to_user"], "✅ Escrow freigegeben.")
-    bot.send_message(tr["from_user"], "✅ Freigabe erfolgreich.")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("esc:shipped:"))
-def esc_shipped(c):
-    t_id = c.data.split(":")[2]
-    tr = conn.execute("SELECT * FROM transfers WHERE id=?", (t_id,)).fetchone()
-    if not tr or tr["type"]!="ESCROW" or tr["to_user"]!=c.from_user.id:
-        bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
-    bot.answer_callback_query(c.id, "Versand gemeldet.")
-    bot.send_message(tr["from_user"], T(tr["from_user"],"seller_shipped_buyer"))
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("esc:dispute:"))
-def esc_dispute(c):
-    t_id = c.data.split(":")[2]
-    tr = conn.execute("SELECT * FROM transfers WHERE id=?", (t_id,)).fetchone()
-    if not tr or tr["type"]!="ESCROW":
-        bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
-    bot.answer_callback_query(c.id, T(c.from_user.id,"dispute_opened"))
-    for aid in ADMIN_IDS:
-        bot.send_message(aid, f"❗ Dispute\nTransfer {t_id}\n{get_username(tr['from_user'])} → {get_username(tr['to_user'])}\nAsset: {tr['asset']}\nAmount: {tr['amount']}")
-
-# ---------- History ----------
-def render_history(uid, limit=12):
-    rows = conn.execute("""
-      SELECT * FROM transfers WHERE from_user=? OR to_user=? ORDER BY datetime(created_at) DESC LIMIT ?
-    """, (uid, uid, limit)).fetchall()
-    if not rows:
-        return T(uid,"history_none")
-    out=["🧾"]
-    for r in rows:
-        direction = "📤" if r["from_user"]==uid else "📥"
-        other = r["to_user"] if r["from_user"]==uid else r["from_user"]
-        mode = "F&F" if r["type"]=="FNF" else "ESCROW"
-        net = Decimal(str(r["amount"])) - Decimal(str(r["fee_taken"]))
-        out.append(T(uid,"history_line", dir=direction, amt=f"{fmt_amount(r['asset'],net)}", other=get_username(other), mode=mode, status=r["status"]))
-    return "\n".join(out)
-
-# ---------- Deposits (SOL + SPL) ----------
-def check_and_book_deposits(uid, src_addr, asset):
-    booked=[]; total=Decimal("0")
-    if ASSETS[asset]["type"]=="SOL":
-        # Prüfe Zentraladresse (native SOL transfers)
-        for s in get_sigs_for(CENTRAL_WALLET_ADDRESS, limit=50):
-            sig = s["signature"]
-            if conn.execute("SELECT 1 FROM deposits WHERE tx_sig=?", (sig,)).fetchone(): continue
-            tx = get_tx(sig)
-            try:
-                insts = tx["transaction"]["message"]["instructions"]
-                for ins in insts:
-                    if ins.get("program")=="system" and ins.get("parsed",{}).get("type")=="transfer":
-                        info = ins["parsed"]["info"]
-                        if info["destination"]==CENTRAL_WALLET_ADDRESS and info["source"]==src_addr:
-                            lam = int(info["lamports"]); amt = Decimal(lam)/Decimal(1e9)
-                            # buchen
-                            dep_id = str(uuid.uuid4())
-                            conn.execute("INSERT INTO deposits(id,user_id,asset,tx_sig,from_address,amount,created_at) VALUES(?,?,?,?,?,?,?)",
-                                         (dep_id, uid, asset, sig, src_addr, float(amt), now_iso()))
-                            adj_balance(uid, asset, delta_av=amt)
-                            booked.append({"tx":sig,"amount":float(amt)})
-                            total += amt
-                            break
-            except: pass
-    else:
-        # SPL: prüfe zentrale ATA
-        ata = str(central_ata(asset))
-        for s in get_sigs_for(ata, limit=50):
-            sig = s["signature"]
-            if conn.execute("SELECT 1 FROM deposits WHERE tx_sig=?", (sig,)).fetchone(): continue
-            tx = get_tx(sig)
-            try:
-                meta = tx["meta"]
-                post = meta.get("postTokenBalances",[])
-                pre = meta.get("preTokenBalances",[])
-                # parser: suche increase des zentralen ATA vom richtigen mint, und Owner=central wallet
-                mint = ASSETS[asset]["mint"]
-                # Finde delta
-                inc = Decimal("0")
-                for pb, qb in zip(pre, post):
-                    if qb["mint"]==mint and qb["owner"]==CENTRAL_WALLET_ADDRESS and qb["accountIndex"]!=pb["accountIndex"]:
-                        # Fallback – unterschiedliche Reihenfolge möglich
-                        pass
-                # Robust: vergleiche sums
-                def sum_bal(bal_list):
-                    s=Decimal("0")
-                    for b in bal_list:
-                        if b["mint"]==mint and b["owner"]==CENTRAL_WALLET_ADDRESS:
-                            ui = Decimal(b["uiTokenAmount"]["uiAmountString"])
-                            s += ui
-                    return s
-                pre_sum = sum_bal(pre)
-                post_sum = sum_bal(post)
-                if post_sum > pre_sum:
-                    inc = post_sum - pre_sum
-                if inc>0:
-                    # Hinweis: Wir können die exakte Sender-Adresse aus parsed inner instructions ziehen; hier matchen wir optional grob
-                    dep_id = str(uuid.uuid4())
-                    conn.execute("INSERT INTO deposits(id,user_id,asset,tx_sig,from_address,amount,created_at) VALUES(?,?,?,?,?,?,?)",
-                                 (dep_id, uid, asset, sig, src_addr, float(inc), now_iso()))
-                    adj_balance(uid, asset, delta_av=inc)
-                    booked.append({"tx":sig,"amount":float(inc)})
-                    total += inc
-            except: pass
-    conn.commit()
-    return booked, float(total)
-
-# ---------- Withdrawals (AUTO on-chain) ----------
-def send_sol(to_addr, amount_sol: Decimal):
-    kp = central_keypair()
-    tx = Transaction()
-    tx.add(transfer(TransferParams(from_pubkey=central_pubkey(), to_pubkey=PublicKey(to_addr), lamports=int(amount_sol*Decimal(1e9)))))
-    res = sol_client.send_transaction(tx, kp, opts=TxOpts(skip_preflight=True))
-    # wait confirmation (best-effort)
-    sol_client.confirm_transaction(res.value)
-    return res.value
-
-def ensure_ata_for(asset, owner_pubkey: PublicKey):
-    mint = PublicKey(ASSETS[asset]["mint"])
-    ata = get_associated_token_address(owner_pubkey, mint)
-    # check if exists
-    info = sol_client.get_account_info(ata)
-    if info.value is None:
-        kp = central_keypair()
-        tx = Transaction()
-        tx.add(create_associated_token_account(payer=central_pubkey(), owner=owner_pubkey, mint=mint))
-        res = sol_client.send_transaction(tx, kp, opts=TxOpts(skip_preflight=True))
-        sol_client.confirm_transaction(res.value)
-    return ata
-
-def send_spl(asset, to_owner_addr, amount_ui: Decimal):
-    kp = central_keypair()
-    mint = PublicKey(ASSETS[asset]["mint"])
-    dec = ASSETS[asset]["decimals"]
-    to_owner = PublicKey(to_owner_addr)
-    dest_ata = ensure_ata_for(asset, to_owner)
-    src_ata = central_ata(asset)
-    amt = int(amount_ui * (10**dec))
-    tx = Transaction()
-    tx.add(transfer_checked(
-        program_id=TOKEN_PROGRAM_ID,
-        source=src_ata,
-        mint=mint,
-        dest=dest_ata,
-        owner=central_pubkey(),
-        amount=amt,
-        decimals=dec,
-        signers=[]
-    ))
-    res = sol_client.send_transaction(tx, kp, opts=TxOpts(skip_preflight=True))
-    sol_client.confirm_transaction(res.value)
-    return res.value
-
-def create_withdraw(uid, asset, to_addr, amount_ui: Decimal):
-    # interne fee
-    fee = dquant((amount_ui*Decimal(str(WITHDRAW_FEE_PERCENT))/Decimal("100")) + Decimal(str(WITHDRAW_FEE_FIXED)), ASSETS[asset]["decimals"])
-    pay = dquant(amount_ui - fee, ASSETS[asset]["decimals"])
-    if pay <= 0: raise RuntimeError("amount too small")
-    # Saldo prüfen & reservieren
-    av,_ = get_balance(uid, asset)
-    if amount_ui > av: raise RuntimeError("insufficient balance")
-    adj_balance(uid, asset, delta_av=-amount_ui)
-    wid = str(uuid.uuid4())
-    conn.execute("""INSERT INTO withdrawals(id,user_id,asset,to_address,amount,fee_taken,status,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?, ?, ?)""",
-                 (wid, uid, asset, to_addr, float(amount_ui), float(fee), "pending", now_iso(), now_iso())); conn.commit()
-    # On-chain senden
-    try:
-        if ASSETS[asset]["type"]=="SOL":
-            sig = send_sol(to_addr, pay)
-        else:
-            sig = send_spl(asset, to_addr, pay)
-        conn.execute("UPDATE withdrawals SET status='paid', tx_sig=?, updated_at=? WHERE id=?",
-                     (sig, now_iso(), wid)); conn.commit()
-        bot.send_message(uid, T(uid,"withdraw_done", tx=sig))
-    except Exception as e:
-        # rollback Guthaben
-        adj_balance(uid, asset, delta_av=amount_ui)
-        conn.execute("UPDATE withdrawals SET status='error', error=?, updated_at=? WHERE id=?",
-                     (str(e), now_iso(), wid)); conn.commit()
-        bot.send_message(uid, T(uid,"withdraw_err", e=str(e)))
-        raise
-
-def on_withdraw_addr(m):
-    addr = m.text.strip()
-    if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", addr):
-        bot.reply_to(m, "Bitte eine gültige Solana-Adresse senden."); return
-    bot.reply_to(m, T(m.from_user.id,"withdraw_amount"))
-    bot.register_next_step_handler(m, lambda x: on_withdraw_amount(x, addr))
-
-def on_withdraw_amount(m, to_addr):
-    try:
-        amt, asset = parse_amount_asset(m.text)
-        if amt <= 0: raise ValueError()
-    except Exception:
-        bot.reply_to(m, "Ungültig."); return
-    u = get_user(m.from_user.id)
-    payload = {"stage":"wd","to":to_addr,"amt":str(amt),"asset":asset}
-    if u["twofa_enabled"]:
-        code = gen_code()
-        payload["code"]=code
-        conn.execute("UPDATE users SET twofa_payload=? WHERE user_id=?", (json.dumps(payload), m.from_user.id)); conn.commit()
-        bot.reply_to(m, f"🔐 Code: <code>{code}</code> – antworte zur Bestätigung.")
-        bot.register_next_step_handler(m, lambda x: confirm_withdraw_code(x, payload))
-    else:
-        try:
-            create_withdraw(m.from_user.id, asset, to_addr, amt)
-            bot.reply_to(m, T(m.from_user.id,"withdraw_created"))
-        except Exception as e:
-            bot.reply_to(m, T(m.from_user.id,"withdraw_err", e=str(e)))
-
-def confirm_withdraw_code(m, payload):
-    if m.text.strip()!=payload.get("code"):
-        bot.reply_to(m, "Falscher Code."); conn.execute("UPDATE users SET twofa_payload=NULL WHERE user_id=?", (m.from_user.id,)); conn.commit(); return
-    try:
-        create_withdraw(m.from_user.id, payload["asset"], payload["to"], Decimal(payload["amt"]))
-        bot.reply_to(m, T(m.from_user.id,"withdraw_created"))
-    except Exception as e:
-        bot.reply_to(m, T(m.from_user.id,"withdraw_err", e=str(e)))
-    finally:
-        conn.execute("UPDATE users SET twofa_payload=NULL WHERE user_id=?", (m.from_user.id,)); conn.commit()
-
-# ---------- Support ----------
-@bot.message_handler(commands=["reply"])
-def admin_reply(m):
-    if not is_admin(m.from_user.id): return
-    try:
-        _, uid, text = m.text.split(maxsplit=2)
-        uid = int(uid)
-    except:
-        bot.reply_to(m, "Usage: /reply <user_id> <text>"); return
-    bot.send_message(uid, f"🛠 Support: {text}")
-    bot.reply_to(m, "Gesendet.")
-
-@bot.callback_query_handler(func=lambda c: c.data=="m:sup")
-def cb_support(c):
-    msg = bot.send_message(c.message.chat.id, T(c.from_user.id,"support_prompt"))
-    bot.register_next_step_handler(msg, on_support_msg)
-
-def on_support_msg(m):
-    txt = m.text or "(ohne Text)"
-    for aid in ADMIN_IDS:
-        bot.send_message(aid, f"🆘 Support von @{get_username(m.from_user.id)} ({m.from_user.id}):\n\n{txt}\n\n/reply {m.from_user.id} <Text>")
-    bot.reply_to(m, "Danke! Wir melden uns hier im Chat.")
-
-# ---------- Fallback ----------
 @bot.message_handler(commands=["menu"])
 def cmd_menu(m):
     ensure_user(m.from_user)
-    bot.send_message(m.chat.id, T(m.from_user.id,"menu"), reply_markup=main_menu(m.from_user.id))
+    bot.reply_to(m, T(m.from_user.id,"menu"), reply_markup=menu(m.from_user.id))
 
+# ------------- Callbacks / Screens ------------
+@bot.callback_query_handler(func=lambda c: True)
+def on_cb(c):
+    ensure_user(c.from_user)
+    data=c.data
+    if data in ("m:home","m:bal"):
+        lines=[]
+        for a in ASSETS:
+            av,hd = bal(c.from_user.id,a)
+            lines.append(T(c.from_user.id,"line", asset=a, av=fmt(a,av), hd=fmt(a,hd)))
+        u=get_user(c.from_user.id)
+        txt=T(c.from_user.id,"balance", lines="\n".join(lines), tag=u["deposit_tag"], addr=CENTRAL_WALLET_ADDRESS)
+        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=menu(c.from_user.id))
+
+    elif data=="m:dep":
+        u=get_user(c.from_user.id)
+        bot.edit_message_text(T(c.from_user.id,"deposit_info", addr=CENTRAL_WALLET_ADDRESS, tag=u["deposit_tag"], min=f"{MIN_DEPOSIT_SOL} SOL"),
+                              c.message.chat.id, c.message.message_id, reply_markup=menu(c.from_user.id))
+
+    elif data=="m:send":
+        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"send_who"))
+        bot.register_next_step_handler(msg, send_who)
+
+    elif data=="m:hist":
+        rows = conn.execute("SELECT * FROM tx_log WHERE user_from=? OR user_to=? ORDER BY datetime(created_at) DESC LIMIT 20",
+                            (c.from_user.id, c.from_user.id)).fetchall()
+        if not rows:
+            txt = T(c.from_user.id,"history_none")
+        else:
+            out=["🧾 <b>Verlauf</b>"]
+            for r in rows:
+                meta = json.loads(r["meta"] or "{}")
+                sig = r["chain_sig"] or "-"
+                if r["type"]=="deposit":
+                    out.append(f"➕ {fmt(r['asset'], r['amount'])} | tx: <code>{sig}</code>")
+                elif r["type"]=="send":
+                    other = r["user_to"]
+                    out.append(f"📤 {fmt(r['asset'], r['amount'])} → @{get_username(other)} (fee {Decimal(str(r['fee']))}%)")
+                elif r["type"]=="escrow_hold":
+                    other = r["user_to"]
+                    out.append(f"🛡️ HOLD {fmt(r['asset'], r['amount'])} → @{get_username(other)} (fee {Decimal(str(r['fee']))}%)")
+                elif r["type"]=="escrow_release":
+                    other = r["user_to"]
+                    out.append(f"✅ RELEASE {fmt(r['asset'], r['amount'])} → @{get_username(other)}")
+                elif r["type"]=="withdraw":
+                    out.append(f"💸 {fmt(r['asset'], r['amount'])} → {meta.get('to','addr')} | tx: <code>{sig}</code>")
+            txt="\n".join(out)
+        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=menu(c.from_user.id))
+
+    elif data=="m:wd":
+        msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"withdraw_addr", min=f"{MIN_WITHDRAW_SOL} SOL"))
+        bot.register_next_step_handler(msg, wd_addr)
+
+    elif data=="m:set":
+        u=get_user(c.from_user.id); twofa="AN" if u["twofa_enabled"] else "AUS"
+        txt=T(c.from_user.id,"settings", lang=u["lang"], twofa=twofa, ref=u["ref_code"])
+        kb=InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔐 2FA AN/AUS", callback_data="set:2fa"))
+        kb.add(InlineKeyboardButton("🌐 Deutsch", callback_data="set:lang:de"),
+               InlineKeyboardButton("🌐 English", callback_data="set:lang:en"))
+        kb.add(InlineKeyboardButton("⬅️ Back", callback_data="m:home"))
+        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+    elif data=="set:2fa":
+        u=get_user(c.from_user.id)
+        val=0 if u["twofa_enabled"] else 1
+        conn.execute("UPDATE users SET twofa_enabled=? WHERE user_id=?", (val, c.from_user.id)); conn.commit()
+        bot.answer_callback_query(c.id, T(c.from_user.id,"twofa_toggled", st=("AN" if val else "AUS")))
+        on_cb(type("obj",(),{"data":"m:set","from_user":c.from_user,"message":c.message,"id":c.id}))
+
+    elif data.startswith("esc:release:"):
+        t_id=data.split(":")[2]
+        tr = conn.execute("SELECT * FROM tx_log WHERE id=? AND type='escrow_hold'", (t_id,)).fetchone()
+        if not tr or tr["user_from"]!=c.from_user.id:
+            bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
+        amt=Decimal(str(tr["amount"])); asset=tr["asset"]; seller=tr["user_to"]
+        av,hd = bal(seller, asset)
+        if hd < amt:
+            bot.answer_callback_query(c.id, "Fehler: nicht genug gehalten.", show_alert=True); return
+        bal_set(seller, asset, av+amt, hd-amt)
+        conn.execute("INSERT INTO tx_log(id,type,user_from,user_to,asset,amount,fee,chain_sig,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (str(uuid.uuid4()),"escrow_release",tr["user_from"],tr["user_to"],asset,float(amt),0,None,"{}",now_iso()))
+        conn.commit()
+        bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_release_ok"))
+        bot.send_message(tr["user_to"], "✅ Betrag aus Escrow freigegeben.")
+
+    elif data.startswith("esc:dispute:"):
+        t_id=data.split(":")[2]
+        tr = conn.execute("SELECT * FROM tx_log WHERE id=? AND type='escrow_hold'", (t_id,)).fetchone()
+        if not tr:
+            bot.answer_callback_query(c.id, "Nicht zulässig.", show_alert=True); return
+        for a in ADMIN_IDS:
+            bot.send_message(a, f"⚠️ Dispute: BUYER @{get_username(tr['user_from'])} vs SELLER @{get_username(tr['user_to'])} | {fmt(tr['asset'],tr['amount'])}\nTxID: {t_id}")
+        bot.answer_callback_query(c.id, T(c.from_user.id,"escrow_dispute_open"))
+
+# ------------------ DEPOSIT FLOW ----------------
+def credit_deposit(uid, sol_amt, sig):
+    # Gutschrift & Log
+    bal_adj(uid, "SOL", da=Decimal(sol_amt))
+    conn.execute("INSERT INTO tx_log(id,type,user_from,user_to,asset,amount,fee,chain_sig,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (str(uuid.uuid4()),"deposit",uid,None,"SOL",float(sol_amt),0,str(sig),"{}",now_iso()))
+    conn.commit()
+    try:
+        bot.send_message(uid, T(uid,"deposit_booked", amt=str(sol_amt), sig=sig))
+    except: pass
+
+def scan_deposits_loop():
+    print("Deposit-Scanner gestartet.")
+    while True:
+        try:
+            # hole die letzten 50 Signaturen für die zentrale Wallet
+            sigs = get_sigs_for(CENTRAL_WALLET_ADDRESS, limit=50)
+            for s in sigs:
+                sig = s["signature"]
+                seen = conn.execute("SELECT 1 FROM deposit_seen WHERE sig=?", (sig,)).fetchone()
+                if seen: continue
+                tx = get_tx(sig)
+                # parse: finde Memo = U<user_id>, amount in SOL an CENTRAL_WALLET_ADDRESS
+                try:
+                    meta = tx.get("meta",{})
+                    # Memo extrahieren
+                    memo = None
+                    for i in tx["transaction"]["message"]["instructions"]:
+                        if i.get("parsed",{}).get("type")=="memo":
+                            memo = i["parsed"]["info"]["memo"]
+                            break
+                    if not memo or not memo.startswith("U") or not memo[1:].isdigit():
+                        # wir markieren als gesehen, aber ignorieren (fremde Zahlungen)
+                        conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,)); conn.commit()
+                        continue
+                    uid = int(memo[1:])
+                    # Amount an zentrale Adresse finden
+                    post = meta.get("postTokenBalances", [])  # (für SPL – hier SOL)
+                    # Für SOL: meta['preBalances']/['postBalances'] in Lamports
+                    pre = meta.get("preBalances", [])
+                    postb = meta.get("postBalances", [])
+                    # finde index der Zentraladresse im accountKeys
+                    keys = tx["transaction"]["message"]["accountKeys"]
+                    idx = None
+                    for ix,k in enumerate(keys):
+                        if k.get("pubkey")==CENTRAL_WALLET_ADDRESS:
+                            idx = ix; break
+                    if idx is None or idx>=len(pre) or idx>=len(postb):
+                        conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,)); conn.commit()
+                        continue
+                    delta_lamports = postb[idx]-pre[idx]
+                    if delta_lamports<=0:
+                        conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,)); conn.commit()
+                        continue
+                    sol_amt = Decimal(delta_lamports) / Decimal(1_000_000_000)
+                    if sol_amt < MIN_DEPOSIT_SOL:
+                        conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,)); conn.commit()
+                        continue
+                    credit_deposit(uid, dquant(sol_amt,9), sig)
+                finally:
+                    conn.execute("INSERT OR IGNORE INTO deposit_seen(sig) VALUES(?)", (sig,))
+                    conn.commit()
+        except requests.HTTPError:
+            # z. B. 429 – stille Pause
+            time.sleep(3)
+        except Exception as e:
+            print("Deposit-Scanner Fehler:", e)
+        time.sleep(DEPOSIT_POLL_SECONDS)
+
+# ------------------ SEND FLOW -------------------
+def send_who(m):
+    u = m.text.strip().lstrip("@")
+    row = get_user_by_username(u)
+    if not row:
+        bot.reply_to(m, f"@{u} nicht gefunden. (Empfänger muss /start ausführen.)"); return
+    if row["user_id"]==m.from_user.id:
+        bot.reply_to(m, "Du kannst dir selbst nichts senden."); return
+    msg = bot.reply_to(m, T(m.from_user.id,"send_amt", u=row["username"] or row["user_id"]))
+    bot.register_next_step_handler(msg, lambda x: send_amount(x, row["user_id"], row["username"] or str(row["user_id"])))
+
+def send_amount(m, to_uid, to_uname):
+    try:
+        amt = Decimal(m.text.replace(",",".").strip())
+        if amt<=0: raise ValueError
+    except Exception:
+        bot.reply_to(m, T(m.from_user.id,"err_amt")); return
+    av,_ = bal(m.from_user.id, "SOL")
+    if amt>av:
+        bot.reply_to(m, T(m.from_user.id,"err_balance", av=fmt("SOL",av))); return
+    kb=InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(I18N[get_user(m.from_user.id)["lang"]]["mode_fnf"],
+                                callback_data=f"send:go:FNF:{to_uid}:{to_uname}:{amt}"))
+    kb.add(InlineKeyboardButton(I18N[get_user(m.from_user.id)["lang"]]["mode_escrow"],
+                                callback_data=f"send:go:ESCROW:{to_uid}:{to_uname}:{amt}"))
+    bot.reply_to(m, T(m.from_user.id,"send_mode", amt=str(amt)), reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("send:go:"))
+def send_go(c):
+    _,_,mode,to_uid,to_uname,amt = c.data.split(":")
+    to_uid=int(to_uid); amt=Decimal(amt)
+    # 2FA?
+    u=get_user(c.from_user.id)
+    if u["twofa_enabled"]:
+        code=''.join(random.choices(string.digits,k=6))
+        bot.answer_callback_query(c.id, f"🔐 Code: {code}")
+        bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
+        def check_code(m):
+            if m.text.strip()!=code: bot.reply_to(m,"Falscher Code."); return
+            do_send(m.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
+        bot.register_next_step_handler(c.message, check_code)
+    else:
+        do_send(c.message.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
+
+def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
+    av,_=bal(from_uid, "SOL")
+    if amt>av:
+        bot.send_message(chat_id, T(from_uid,"err_balance", av=fmt("SOL",av))); return
+    fee_percent = FEE_FNF + (FEE_ESCROW_EXTRA if mode=="ESCROW" else Decimal("0"))
+    fee = dquant(amt * fee_percent / Decimal("100"), 9)
+    net = dquant(amt - fee, 9)
+    # abbuchen Sender
+    bal_adj(from_uid, "SOL", da=-amt)
+    # fee an "System" (User 0)
+    bal_adj(0, "SOL", da=fee)
+    if mode=="FNF":
+        bal_adj(to_uid, "SOL", da=net)
+        conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (str(uuid.uuid4()),"send",from_uid,to_uid,"SOL",float(net),float(fee),None,"{}",now_iso()))
+        bot.send_message(chat_id, T(from_uid,"sent_fnf_sender", u=(get_username(to_uid)), amt=str(net), fee=str(fee_percent)))
+        bot.send_message(to_uid,   T(to_uid,"sent_fnf_recv",   u=(get_username(from_uid)), amt=str(net)))
+    else:
+        bal_adj(to_uid, "SOL", dh=net)
+        t_id=str(uuid.uuid4())
+        conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (t_id,"escrow_hold",from_uid,to_uid,"SOL",float(net),float(fee),None,"{}",now_iso()))
+        kb=InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(T(from_uid,"escrow_btn_release"), callback_data=f"esc:release:{t_id}"),
+               InlineKeyboardButton(T(from_uid,"escrow_btn_dispute"), callback_data=f"esc:dispute:{t_id}"))
+        bot.send_message(chat_id, T(from_uid,"escrow_hold_s", u=get_username(to_uid), amt=str(net)), reply_markup=kb)
+        bot.send_message(to_uid, T(to_uid,"escrow_hold_r", u=get_username(from_uid), amt=str(net)))
+    conn.commit()
+
+# ------------------ WITHDRAW (echte On-Chain) --------------
+def is_valid_pubkey(addr:str)->bool:
+    return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", addr))
+
+def withdraw_sol(to_addr:str, sol_amt:Decimal)->str:
+    # baut & signiert eine echte SOL-Transaktion mit solders/solana
+    if not is_valid_pubkey(to_addr):
+        raise ValueError("invalid address")
+    to_pk = PublicKey.from_string(to_addr)
+    tx = Transaction()
+    tx.add(transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=to_pk, lamports=int(sol_amt*Decimal(1_000_000_000)))))
+    # Blockhash
+    bh = rpc.get_latest_blockhash().value.blockhash
+    tx.recent_blockhash = bh
+    tx.fee_payer = kp.pubkey()
+    tx_signed = tx.sign([kp])
+    # senden
+    resp = rpc.send_transaction(tx_signed, opts=TxOpts(skip_preflight=False, max_retries=3))
+    sig = resp.value
+    # optional: confirm
+    rpc.confirm_transaction(sig)
+    return sig
+
+def wd_addr(m):
+    addr=m.text.strip()
+    if not is_valid_pubkey(addr):
+        bot.reply_to(m, T(m.from_user.id,"err_addr")); return
+    msg=bot.reply_to(m, T(m.from_user.id,"withdraw_amt", min=f"{MIN_WITHDRAW_SOL} SOL", max=f"{MAX_WITHDRAW_SOL} SOL"))
+    bot.register_next_step_handler(msg, lambda x: wd_amount(x, addr))
+
+def wd_amount(m, to_addr):
+    try:
+        amt = Decimal(m.text.replace(",",".").strip())
+        if amt<=0 or amt<MIN_WITHDRAW_SOL or amt>MAX_WITHDRAW_SOL: raise ValueError
+    except Exception:
+        bot.reply_to(m, T(m.from_user.id,"err_amt")); return
+    av,_=bal(m.from_user.id, "SOL")
+    if amt>av:
+        bot.reply_to(m, T(m.from_user.id,"err_balance", av=fmt("SOL",av))); return
+
+    u=get_user(m.from_user.id)
+    def finalize():
+        # abbuchen, on-chain senden
+        try:
+            sig = withdraw_sol(to_addr, dquant(amt,9))
+        except requests.HTTPError:
+            bot.reply_to(m, T(m.from_user.id,"err_rpc")); return
+        except Exception as e:
+            bot.reply_to(m, f"Auszahlung fehlgeschlagen: {e}"); return
+
+        bal_adj(m.from_user.id, "SOL", da=-amt)
+        meta={"to": to_addr}
+        conn.execute("INSERT INTO tx_log VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (str(uuid.uuid4()),"withdraw",m.from_user.id,None,"SOL",float(amt),0,str(sig),json.dumps(meta),now_iso()))
+        conn.commit()
+        bot.reply_to(m, T(m.from_user.id,"withdraw_ok", amt=str(amt), sig=str(sig)), reply_markup=menu(m.from_user.id))
+
+    if u["twofa_enabled"]:
+        code=''.join(random.choices(string.digits,k=6))
+        bot.reply_to(m, f"🔐 2FA – antworte mit: <code>{code}</code>")
+        def check_code(x):
+            if x.text.strip()!=code: bot.reply_to(x,"Falscher Code."); return
+            finalize()
+        bot.register_next_step_handler(m, check_code)
+    else:
+        finalize()
+
+# ------------------ SUPPORT -------------------
+@bot.callback_query_handler(func=lambda c: c.data=="m:sup")
+def sup(c):
+    msg=bot.send_message(c.message.chat.id, T(c.from_user.id,"support_prompt"))
+    bot.register_next_step_handler(msg, sup_msg)
+
+def sup_msg(m):
+    txt=m.text or "(ohne Text)"
+    for a in ADMIN_IDS:
+        bot.send_message(a, f"🆘 Support von @{get_username(m.from_user.id)} ({m.from_user.id}):\n\n{txt}")
+    bot.reply_to(m, "Danke! Wir melden uns hier im Chat.", reply_markup=menu(m.from_user.id))
+
+# ------------------ FALLBACK ------------------
 @bot.message_handler(content_types=["text","photo","document","sticker","video","audio","voice"])
 def any_msg(m):
     ensure_user(m.from_user)
-    bot.send_message(m.chat.id, T(m.from_user.id,"menu"), reply_markup=main_menu(m.from_user.id))
+    bot.send_message(m.chat.id, T(m.from_user.id,"menu"), reply_markup=menu(m.from_user.id))
 
-# ---------- Run ----------
-if __name__ == "__main__":
-    print("Starting bot...")
+# ------------------ START SCANNER THREAD ------
+def start_threads():
+    t=threading.Thread(target=scan_deposits_loop, daemon=True)
+    t.start()
+
+# ------------------ MAIN ----------------------
+if __name__=="__main__":
+    print("Starting ProofPay (SOL live).")
+    start_threads()
     bot.infinity_polling(skip_pending=True, timeout=20)
