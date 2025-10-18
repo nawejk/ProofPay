@@ -469,6 +469,32 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     conn.commit()
 
 # ------------------ WITHDRAW (echte On-Chain) --------------
+def _extract_latest_blockhash(resp):
+    # robust gegen dict/RPCResponse
+    try:
+        return resp["result"]["value"]["blockhash"]
+    except Exception:
+        pass
+    try:
+        return resp.value.blockhash  # falls Objekt
+    except Exception:
+        pass
+    raise RuntimeError(f"unexpected get_latest_blockhash() response: {resp}")
+
+def _extract_sig(resp):
+    # robust gegen dict/RPCResponse
+    if isinstance(resp, dict):
+        # je nach solana-py-Version
+        if "result" in resp and isinstance(resp["result"], str):
+            return resp["result"]
+        if "value" in resp and isinstance(resp["value"], str):
+            return resp["value"]
+    try:
+        return resp.value
+    except Exception:
+        pass
+    raise RuntimeError(f"unexpected send_transaction() response: {resp}")
+
 def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
@@ -482,12 +508,14 @@ def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
         )
     )
     tx.add(instr)
-    bh = rpc.get_latest_blockhash().value.blockhash
+    # ---- FIX: robustes Lesen des Blockhash + korrektes Signieren ----
+    bh_resp = rpc.get_latest_blockhash()
+    bh = _extract_latest_blockhash(bh_resp)
     tx.recent_blockhash = bh
     tx.fee_payer = kp.public_key
-    tx_signed = tx.sign([kp])  # solana.Keypair => passt
-    resp = rpc.send_transaction(tx_signed, opts=TxOpts(skip_preflight=False, max_retries=3))
-    sig = resp.value
+    tx.sign(kp)  # <— kein list, kein solders
+    resp = rpc.send_transaction(tx, opts=TxOpts(skip_preflight=False, max_retries=3))
+    sig = _extract_sig(resp)
     rpc.confirm_transaction(sig)
     return sig
 
@@ -526,11 +554,12 @@ def wd_amount(m, to_addr):
 
     if u["twofa_enabled"]:
         code=''.join(random.choices(string.digits,k=6))
-        bot.reply_to(m, f"🔐 2FA – antworte mit: <code>{code}</code>")
+        # ---- FIX: Handler an die Prompt-Nachricht binden ----
+        msg = bot.reply_to(m, f"🔐 2FA – antworte mit: <code>{code}</code>")
         def check_code(x):
             if (x.text or "").strip()!=code: bot.reply_to(x,"Falscher Code."); return
             finalize()
-        bot.register_next_step_handler(m, check_code)
+        bot.register_next_step_handler(msg, check_code)
     else:
         finalize()
 
@@ -549,7 +578,7 @@ def on_cb(c):
     ensure_user(c.from_user)
     data=c.data or ""
 
-    # Spezialfälle zuerst (damit nichts verschluckt wird)
+    # Spezialfälle zuerst
     if data.startswith("send:go:"):
         _,_,mode,to_uid,to_uname,amt = data.split(":")
         to_uid=int(to_uid); amt=Decimal(amt)
@@ -557,11 +586,12 @@ def on_cb(c):
         if u["twofa_enabled"]:
             code=''.join(random.choices(string.digits,k=6))
             bot.answer_callback_query(c.id, f"🔐 Code: {code}")
-            bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
+            # ---- FIX: Handler an die Prompt-Nachricht binden ----
+            msg = bot.send_message(c.message.chat.id, f"🔐 2FA – antworte mit: <code>{code}</code>")
             def check_code(m):
                 if (m.text or "").strip()!=code: bot.reply_to(m,"Falscher Code."); return
                 do_send(m.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
-            bot.register_next_step_handler(c.message, check_code)
+            bot.register_next_step_handler(msg, check_code)
         else:
             do_send(c.message.chat.id, c.from_user.id, to_uid, to_uname, amt, mode)
         return
