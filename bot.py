@@ -239,7 +239,7 @@ def menu(uid):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_balance"], callback_data="m:bal"))
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_deposit"], callback_data="m:dep"),
-           InlineKeyboardButton(I18N[u["lang"]"]["btn_send"], callback_data="m:send"))
+           InlineKeyboardButton(I18N[u["lang"]]["btn_send"], callback_data="m:send"))
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_withdraw"], callback_data="m:wd"),
            InlineKeyboardButton(I18N[u["lang"]]["btn_history"], callback_data="m:hist"))
     kb.add(InlineKeyboardButton(I18N[u["lang"]]["btn_settings"], callback_data="m:set"),
