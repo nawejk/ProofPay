@@ -28,13 +28,13 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ---- Solana libs (für echte Auszahlung) ----
-from solana.keypair import Keypair
-from solana.publickey import PublicKey
-from solana.system_program import transfer, TransferParams
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey as PublicKey
+from solders.system_program import transfer, TransferParams
+
 from solana.rpc.api import Client
 from solana.transaction import Transaction
 from solana.rpc.types import TxOpts
-
 # ------------------ ENV ---------------------
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN","8222875136:AAFAa9HtRL-g23ganuckjCq5IIW9udQXOZo").strip()
@@ -603,22 +603,34 @@ def do_send(chat_id, from_uid, to_uid, to_uname, amt, mode):
     conn.commit()
 
 # ------------------ WITHDRAW (echte On-Chain) --------------
-def withdraw_sol(to_addr:str, sol_amt:Decimal)->str:
-    if not is_valid_pubkey(to_addr):
+def withdraw_sol(to_addr: str, sol_amt: Decimal) -> str:
+    # Address validate (Base58 32..44)
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", to_addr or ""):
         raise ValueError("invalid address")
-    to_pk = PublicKey(to_addr)
+
+    to_pk = PublicKey.from_string(to_addr)  # solders.Pubkey
     tx = Transaction()
-    instr = transfer(TransferParams(from_pubkey=kp.public_key, to_pubkey=to_pk, lamports=int(sol_amt*Decimal(1_000_000_000))))
+    # Instruction aus solders.system_program
+    instr = transfer(
+        TransferParams(
+            from_pubkey=kp.pubkey(),
+            to_pubkey=to_pk,
+            lamports=int(sol_amt * Decimal(1_000_000_000))
+        )
+    )
     tx.add(instr)
-    # Blockhash
+
+    # Blockhash setzen & Fee Payer
     bh = rpc.get_latest_blockhash().value.blockhash
     tx.recent_blockhash = bh
-    tx.fee_payer = kp.public_key
-    tx.sign(kp)
-    # senden
-    resp = rpc.send_transaction(tx, kp, opts=TxOpts(skip_preflight=False, max_retries=3))
+    tx.fee_payer = kp.pubkey()
+
+    # Signieren mit solders.Keypair
+    tx_signed = tx.sign([kp])
+
+    # Senden & optional bestätigen
+    resp = rpc.send_transaction(tx_signed, opts=TxOpts(skip_preflight=False, max_retries=3))
     sig = resp.value
-    # optional confirm
     rpc.confirm_transaction(sig)
     return sig
 
